@@ -1,0 +1,4128 @@
+#--------------------------------------------------------------------------------
+# Substitutions used further down in the code
+#--------------------------------------------------------------------------------
+substitutions:
+  web_port: "80"
+  web_version: "2"
+  name: "pau"
+  friendly_name: "Pool Automation Unit"
+  comment: "All in one swimming pool controller"
+  area: "Tuinhuis"
+  gpioRestartButton: GPIO01
+  gpioStatusLed: GPIO02
+  relay6: GPIO04
+  relay5: GPIO05
+  gpioAcidDosing: GPIO06
+  gpioChlorineDosing: GPIO07
+  gpioHeatpumpFlow: GPIO08
+  i2c_sda: GPIO09 #TX
+  i2c_scl: GPIO10 #RX
+  clk_pin: GPIO12
+  mosi_pin: GPIO11
+  miso_pin: GPIO13
+  gpioBacklight: GPIO14
+  gpioFairlandkWh: GPIO15
+  gpioFlairkWh: GPIO16
+  gpioOnewire: GPIO17
+  gpioWaterFlow: GPIO18
+  reset_pin: GPIO21
+  gpioPir: GPIO38
+  uart_tx_drive: GPIO40 # in pcb design GPIO39/RXA labels are switched (RI)
+  uart_rx_drive: GPIO39 # in pcb design GPIO40/TXA labels are switched (RO)
+  uart_tx_light: GPIO42 #TXB
+  uart_rx_light: GPIO41 #RXB
+  uart_tx_fairland: GPIO43 #TXC
+  uart_rx_fairland: GPIO44 #RXC
+  dc_pin: GPIO47
+  cs_pin: GPIO48
+#--------------------------------------------------------------------------------
+# Default config
+#--------------------------------------------------------------------------------
+
+esphome:
+  includes:
+    - display_helpers.h
+    - plp_helper.h
+    - schedule_helper.h
+  name: ${name}
+  friendly_name: ${friendly_name}
+  comment: ${comment}
+  area: ${area}
+  name_add_mac_suffix: false
+  #debug_scheduler: true
+  on_boot:
+    priority: -100
+    then:
+      - if:
+          condition:
+            lambda: 'return id(season_selector).current_option() == "Winter";'
+          then:
+            - select.set:
+                id: drive_freq_set
+                option: "25 Hz"
+          else:
+            - select.set:
+                id: drive_freq_set
+                option: "37 Hz"
+      - component.update: drive_on_boot_ramp
+      - lambda: |-
+          int rx  = 0;
+          rx = (id(rx_expected_value));
+          auto call = id(set_rx_level).make_call();
+          call.set_value(rx);
+          call.perform();
+      - lambda: |-
+          float ph  = 0.0;
+          ph = (id(ph_expected_value));
+          auto call = id(set_ph_level).make_call();
+          call.set_value(ph);
+          call.perform();
+      - display.page.show: page1
+          
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  framework:
+    type: esp-idf
+    advanced:
+      flash_chip: generic
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+# Enable logging
+logger:
+  #hardware_uart: USB_CDC
+  level: INFO
+  baud_rate: 0
+  # logs:
+    # modbus: INFO
+    # modbus_controller: INFO
+    # modbus.number: INFO
+    # modbus_controller.sensor: INFO
+    # modbus_controller.binary_sensor: INFO
+    # modbus_controller.select: INFO
+    # sensor: DEBUG
+    # number: INFO
+    # switch: INFO
+    # select: INFO
+    # pulse_counter: INFO
+    # text_sensor: INFO
+    # component: ERROR
+    # touchscreen: ERROR
+    # ili9xxx: ERROR
+    # dallas.temp.sensor: INFO
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret pool-automation-unit_api_key
+  reboot_timeout: 0s
+  actions:
+    - action: set_pulse_total_fairland
+      variables:
+        new_pulse_total: int
+      then:
+        - pulse_counter.set_total_pulses:
+            id: fairland_pulse_counter
+            value: !lambda 'return new_pulse_total;'
+    - action: set_pulse_total_flair
+      variables:
+        new_pulse_total: int
+      then:
+        - pulse_counter.set_total_pulses:
+            id: flair_pulse_counter
+            value: !lambda 'return new_pulse_total;'
+
+ota:
+  - platform: esphome
+    encryption:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  domain: .not.internal
+  
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "pool-automation-unit"
+    password: !secret pool-automation-unit_ap_password
+
+captive_portal:
+
+#web server esp
+web_server:
+  port: ${web_port}
+  version: ${web_version}
+  ota: false
+
+debug:
+  update_interval: 57s
+
+#Display pins
+spi:
+  clk_pin: ${clk_pin}
+  mosi_pin: ${mosi_pin}
+  miso_pin: ${miso_pin}
+
+#--------------------------------------------------------------------------------
+# Onewire sensors (dallas temperature)
+#--------------------------------------------------------------------------------
+one_wire:
+  - platform: gpio
+    pin: ${gpioOnewire}
+
+#--------------------------------------------------------------------------------
+# Setup i2c - used for pH and Rx 
+#--------------------------------------------------------------------------------
+i2c:
+  sda: ${i2c_sda}
+  scl: ${i2c_scl}
+  scan: true
+  id: bus_a
+  frequency: 400kHz
+
+# Modbus Master on UART1
+modbus:
+  - id: modbus_drive
+    uart_id: uart_drive
+    turnaround_time: 100ms
+    send_wait_time: 200ms
+
+# Modbus Master on UART2
+  - id: modbus_fairland
+    uart_id: uart_fairland
+    turnaround_time: 100ms
+    send_wait_time: 200ms
+
+tca9555:
+  - id: 'tca9555_hub'
+    address: 0x20
+    
+#--------------------------------------------------------------------------------
+# Setup time component
+#--------------------------------------------------------------------------------
+time:
+  - platform: sntp
+    id: current_time
+    timezone: "Europe/Amsterdam"
+    servers:
+     - 0.pool.ntp.org
+     - 1.pool.ntp.org
+
+#--------------------------------------------------------------------------------
+# Global variables used further down in the code
+#--------------------------------------------------------------------------------
+globals:
+  # Holds value if screen should be blanked out; see APP_FLOW_* defines in display_helpers.h
+  # 0 - TFT OFF (APP_FLOW_OFF)
+  # 1 - Default (APP_FLOW_HOME)
+  # 2 - pH calibration (APP_FLOW_CAL_PH)
+  # 3 - Rx calibration (APP_FLOW_CAL_RX)
+  # 4 - Boost for vacuming or backwash (APP_FLOW_BOOST)
+
+  - id: app_flow
+    type: int
+    initial_value: '1'
+
+  # Timers for keeping track of last values
+  - id: app_runtime
+    type: int
+    initial_value: '0'
+
+  - id: pump_runtime
+    type: int
+    initial_value: '0'
+
+  - id: last_ph_calibration
+    type: int
+    initial_value: '0'
+
+  - id: last_rx_calibration
+    type: int
+    initial_value: '0'
+
+  - id: last_acid_dose
+    type: int
+    initial_value: '0'
+
+  - id: last_chlorine_dose
+    type: int
+    initial_value: '0'
+
+  - id: rx_expected_value  
+    type: int
+    initial_value: '675'
+    restore_value: true
+
+  - id: ph_expected_value  
+    type: float
+    initial_value: '7.4'
+    restore_value: true
+
+  - id: temperature_correction
+    type: float
+    initial_value: '0'
+
+  - id: chlorine_pump_state
+    type: bool
+    initial_value: 'false'
+
+  - id: acid_pump_state
+    type: bool
+    initial_value: 'false'
+
+  - id: pir_time
+    type: int
+    initial_value: '0'
+
+  - id: freeze_detection_temp
+    type: float
+    initial_value: '1'
+
+  - id: ezo_interval_enabled
+    type: bool
+    restore_value: no
+    initial_value: "true"
+
+# Holds which homescreen is active (0..3)
+  - id: homescreen_index
+    type: int
+    initial_value: '0'
+
+  - id: dosing_script
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: acid_startup_lockout
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+
+  - id: chlorine_startup_lockout
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+
+  # base color (hue) independent of brightness
+  - id: base_r
+    type: int
+    initial_value: '255'
+  - id: base_g
+    type: int
+    initial_value: '255'
+  - id: base_b
+    type: int
+    initial_value: '255'
+
+  # last sent values to avoid flooding
+  - id: last_sent_r
+    type: int
+    initial_value: '-1'
+  - id: last_sent_g
+    type: int
+    initial_value: '-1'
+  - id: last_sent_b
+    type: int
+    initial_value: '-1'
+  - id: last_sent_bri
+    type: int
+    initial_value: '-1'
+
+  # scene tracking (0..13)
+  - id: current_scene
+    type: int
+    initial_value: '0'
+    
+#--------------------------------------------------------------------------------
+# Setup Datetime component
+#--------------------------------------------------------------------------------
+datetime:
+# Drive
+  - platform: template
+    id: start_time_drive
+    type: time
+    name: Drive Start Time
+    optimistic: yes
+    restore_value: true
+
+  - platform: template
+    id: end_time_drive
+    type: time
+    name: Drive End Time
+    optimistic: yes
+    restore_value: true
+
+ # Fairland   
+  - platform: template
+    id: start_time_fairland
+    type: time
+    name: Fairland Start Time
+    optimistic: yes
+    restore_value: true
+
+  - platform: template
+    id: end_time_fairland
+    type: time
+    name: Fairland End Time
+    optimistic: yes
+    restore_value: true
+
+# --------------------------------------------------------------------------------
+# Interval for scripts, sensors and ph temp correction
+# --------------------------------------------------------------------------------
+interval:
+# interval 5s for home screen and drive schedule
+  - interval: 5s
+    startup_delay: 3s
+    then:
+      - lambda: |-
+          id(drive_schedule).execute();
+          id(homescreen_index) = (id(homescreen_index) + 1) % 5;
+
+# interval 10s for calibration sensor updates
+  - interval: 10s
+    startup_delay: 5s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX;
+          then:
+            - logger.log:
+                format: "Calibration interval enabled"
+                level: INFO
+                tag: calibration_script
+            - component.update: ezo_ph
+            - delay: 3s
+            - component.update: ezo_rx
+          else:
+            - logger.log:
+                format: "Calibration interval disabled."
+                level: DEBUG
+                tag: calibration_script
+
+# interval 30s for dosing script and LCD timer
+  - interval: 30s
+    startup_delay: 7s
+    then:
+      - lambda: |-
+          id(app_runtime)+= 30;
+          if (id(app_runtime) >= 3600) {
+            id(acid_startup_lockout) = false;
+          }
+          if (id(app_runtime) >= 1800) {
+            id(chlorine_startup_lockout) = false;
+          }
+          if (id(dosing_script)) {
+            ESP_LOGI("dosing_script", "Running dosing logic...");
+            id(check_pool_parameters).execute();
+          } else {
+            ESP_LOGI("dosing_script", "Dosing script is disabled.");
+          }
+          id(pir_time)+= 30;
+          id(turn_off_lcd_timer).execute();
+
+# interval 60s for Temp sensors
+  - interval: 60s
+    startup_delay: 13s
+    then:
+      - component.update: temp_poolhouse
+      - delay: 2s
+      - component.update: temp_from_pool
+      - delay: 2s
+      - component.update: temp_from_inverter
+      - delay: 2s
+      - component.update: temp_to_pool
+      - delay: 2s
+
+# Interval for EZO sensors
+  - interval: 60s
+    startup_delay: 17s
+    then:
+      - if:
+          condition:
+            lambda: "return id(ezo_interval_enabled);"
+          then:
+            - component.update: ezo_ph
+            - delay: 3s
+            - component.update: ezo_rx
+
+# Interval for pulse_counters
+  - interval: 60s
+    startup_delay: 21s
+    then:
+      - component.update: flowmeter_water
+      - delay: 7s
+      - component.update: flowmeter_heatpump
+      - delay: 7s
+      - component.update: fairland_pulse_counter
+      - delay: 7s
+      - component.update: flair_pulse_counter
+
+# interval 60s for wifi sensors
+  - interval: 60s
+    startup_delay: 26s
+    then:
+      - component.update: wifisignal
+      - delay: 1s
+      - component.update: wifistep
+
+# interval 60s for text_sensors
+  - interval: 60s
+    startup_delay: 33s
+    then:
+      - component.update: uptime_text
+      - delay: 1s
+      - component.update: on_calibration_text
+      - delay: 1s
+      - component.update: on_temperature_text
+      - delay: 1s
+      - component.update: on_slope_text
+      - delay: 1s
+      - component.update: on_calibration_rx_text
+
+# interval 60s for fairland schedule
+  - interval: 60s
+    startup_delay: 37s
+    then:
+      - lambda: |-
+          if (id(season_selector).current_option() == "Summer") {
+              id(fairland_schedule).execute();
+              ESP_LOGI("fairland_schedule", "Fairland script is enabled.");
+              // retrieve fairland data
+              id(fairland_controller).update();
+          } else {
+            ESP_LOGI("fairland_schedule", "Fairland script is disabled.");
+            if (id(fairland_power).state) {
+               id(fairland_power).turn_off();
+             }
+          }
+        
+# interval 3600s for temp correction pH sensor
+  - interval: 3600s
+    then:
+      - lambda: |-  
+          id(temperature_correction_ph).execute();
+
+#--------------------------------------------------------------------------------
+# Light config
+#--------------------------------------------------------------------------------
+light:
+  # status led
+  - platform: status_led
+    id: esp_state
+    pin: 
+      number: ${gpioStatusLed}
+      inverted: true
+  # pool lights
+  - platform: rgb
+    name: "Pool Lights"
+    id: pool_lights
+    red: dummy_r
+    green: dummy_g
+    blue: dummy_b
+
+    # voor stabiliteit: start altijd uit (voorkomt onverwachte acties bij reboot)
+    restore_mode: ALWAYS_OFF
+
+    on_turn_on:
+      then:
+        - script.execute: plp_send_on
+        - delay: 80ms
+        - script.execute: plp_send_brightness
+        - delay: 80ms
+        - script.execute: plp_send_rgb
+
+    on_turn_off:
+      then:
+        - script.execute: plp_send_off
+
+    on_state:
+      then:
+        - lambda: |-
+            // Only act when HA light is ON
+            if (!id(pool_lights).remote_values.is_on())
+              return;
+
+            // Brightness (0..100)
+            float bri_f = id(pool_lights).remote_values.get_brightness();
+            int bri = (int) lroundf(bri_f * 100.0f);
+            if (bri < 0) bri = 0;
+            if (bri > 100) bri = 100;
+
+            if (bri != id(last_sent_bri)) {
+              id(last_sent_bri) = bri;
+              id(plp_send_brightness).execute();
+            }
+
+            // Compute "base" RGB independent of brightness by normalizing to max channel.
+            float r_f = id(pool_lights).remote_values.get_red();
+            float g_f = id(pool_lights).remote_values.get_green();
+            float b_f = id(pool_lights).remote_values.get_blue();
+
+            float m = fmaxf(r_f, fmaxf(g_f, b_f));
+            if (m < 0.0001f)
+              return;
+
+            int br = (int) lroundf((r_f / m) * 255.0f);
+            int bg = (int) lroundf((g_f / m) * 255.0f);
+            int bb = (int) lroundf((b_f / m) * 255.0f);
+
+            // Clamp
+            br = br < 0 ? 0 : (br > 255 ? 255 : br);
+            bg = bg < 0 ? 0 : (bg > 255 ? 255 : bg);
+            bb = bb < 0 ? 0 : (bb > 255 ? 255 : bb);
+
+            if (br != id(last_sent_r) || bg != id(last_sent_g) || bb != id(last_sent_b)) {
+              id(last_sent_r) = br;
+              id(last_sent_g) = bg;
+              id(last_sent_b) = bb;
+
+              id(base_r) = br;
+              id(base_g) = bg;
+              id(base_b) = bb;
+
+              id(plp_send_rgb).execute();
+            }
+
+  # needed for backlight of TFT screen
+  - platform: binary
+    name: "LCD Backlight"
+    id: lcd_backlight_light
+    output: lcd_backlight
+    restore_mode: ALWAYS_ON
+    internal: true
+
+# needed for rgb light, but doesn't do anything
+output:
+  - platform: template
+    id: dummy_r
+    type: float
+    write_action: []
+  - platform: template
+    id: dummy_g
+    type: float
+    write_action: []
+  - platform: template
+    id: dummy_b
+    type: float
+    write_action: []
+
+# needed for backlight of TFT screen
+  - platform: gpio
+    pin: ${gpioBacklight}
+    id: lcd_backlight  
+  
+#--------------------------------------------------------------------------------
+# Modbus config
+#--------------------------------------------------------------------------------
+uart:
+  - id: uart_fairland
+    tx_pin: ${uart_tx_fairland}
+    rx_pin: ${uart_rx_fairland}
+    baud_rate: 9600
+    stop_bits: 1
+    parity: none
+    # debug:
+    #   direction: BOTH
+    #   dummy_receiver: false
+    #   debug_prefix: "[Command_fairland] "
+    #   after:
+    #     delimiter: "\n"
+    #   sequence:
+    #     - lambda: UARTDebug::log_string(direction, bytes, debug_prefix);
+
+  - id: uart_drive
+    tx_pin: ${uart_tx_drive}
+    rx_pin: ${uart_rx_drive}
+    baud_rate: 115200
+    stop_bits: 1
+    parity: none
+    # debug:
+    #   direction: BOTH
+    #   dummy_receiver: false
+    #   debug_prefix: "[Command_drive] "
+    #   after:
+    #     delimiter: "\n"
+    #   sequence:
+    #     - lambda: UARTDebug::log_string(direction, bytes, debug_prefix);
+
+  - id: uart_light
+    tx_pin: ${uart_tx_light}
+    rx_pin: ${uart_rx_light}
+    baud_rate: 9600
+    data_bits: 8
+    parity: NONE
+    stop_bits: 1
+    # debug:
+    #   direction: BOTH
+    #   dummy_receiver: false
+    #   debug_prefix: "[Command_light] "
+    #   after:
+    #     delimiter: "\n"
+    #   sequence:
+    #     - lambda: UARTDebug::log_string(direction, bytes, debug_prefix);
+
+modbus_controller:
+# Inverter modbus
+  - id: drive
+    ## the Modbus device address
+    address: 0x1
+    modbus_id: modbus_drive
+    setup_priority: -10
+    update_interval: 60s
+    max_cmd_retries: 2
+    offline_skip_updates: 5
+    on_online:
+      then:
+        - logger.log: 
+            format: "Drive back online!"
+            level: INFO
+            tag: modbus_controller
+    on_offline:
+      then:
+        - logger.log: 
+            format: "Drive goes offline!"
+            level: INFO
+            tag: modbus_controller
+
+  - id: drive_on_boot_ramp
+    address: 0x1
+    modbus_id: modbus_drive
+    # No interval
+    # Will be called on boot
+    update_interval: never 
+
+# Fairland modbus 
+  - id: fairland_controller
+    ## the Modbus device address
+    address: 0x1
+    modbus_id: modbus_fairland
+    update_interval: never
+    on_online:
+      then:
+        - logger.log: 
+            format: "Fairland back online!"
+            level: INFO
+            tag: modbus_controller
+    on_offline:
+      then:
+        - logger.log: 
+            format: "Fairland goes offline!"
+            level: INFO
+            tag: modbus_controller
+# --------------------------------------------------------------------------------
+# Switches
+# --------------------------------------------------------------------------------
+switch:
+# TCA9555
+  - platform: gpio
+    name: "TCA9555 P0"
+    icon: mdi:toggle-switch-off-outline
+    pin:
+      tca9555: tca9555_hub
+      number: 0
+      mode: output
+
+  - platform: gpio
+    name: "TCA9555 P1"
+    icon: mdi:toggle-switch-off-outline
+    pin:
+      tca9555: tca9555_hub
+      number: 1
+      mode: output
+
+  - platform: gpio
+    name: "TCA9555 P2"
+    icon: mdi:toggle-switch-off-outline
+    pin:
+      tca9555: tca9555_hub
+      number: 2
+      mode: output
+
+  - platform: gpio
+    name: "TCA9555 P3"
+    icon: mdi:toggle-switch-off-outline
+    pin:
+      tca9555: tca9555_hub
+      number: 3
+      mode: output
+
+  - platform: gpio
+    name: "TCA9555 P4"
+    icon: mdi:toggle-switch-off-outline
+    pin:
+      tca9555: tca9555_hub
+      number: 4
+      mode: output
+
+  - platform: gpio
+    name: "TCA9555 P5"
+    icon: mdi:toggle-switch-off-outline
+    pin:
+      tca9555: tca9555_hub
+      number: 5
+      mode: output
+
+  - platform: gpio
+    name: "TCA9555 P6"
+    icon: mdi:toggle-switch-off-outline
+    pin:
+      tca9555: tca9555_hub
+      number: 6
+      mode: output
+
+  - platform: gpio
+    name: "TCA9555 P7"
+    icon: mdi:toggle-switch-off-outline
+    pin:
+      tca9555: tca9555_hub
+      number: 7
+      mode: output
+
+  - platform: gpio
+    name: "TCA9555 P10"
+    icon: mdi:toggle-switch-off-outline
+    pin:
+      tca9555: tca9555_hub
+      number: 8
+      mode: output
+
+  - platform: gpio
+    name: "TCA9555 P11"
+    icon: mdi:toggle-switch-off-outline
+    pin:
+      tca9555: tca9555_hub
+      number: 9
+      mode: output
+
+  # Relay 1
+  - platform: gpio
+    name: "Relay 1" # TCA9555 P12
+    icon: mdi:toggle-switch-off-outline
+    pin:
+      tca9555: tca9555_hub
+      number: 10
+      mode: output
+      inverted: true
+
+  # Relay 2
+  - platform: gpio
+    name: "Relay 2" # TCA9555 P13
+    icon: mdi:toggle-switch-off-outline
+    pin:
+      tca9555: tca9555_hub
+      number: 11
+      mode: output
+      inverted: true
+  
+  # Disable EZO Sensor
+  - platform: gpio
+    name: "TCA9555 P14"
+    pin:
+      tca9555: tca9555_hub
+      number: 12
+      mode: output
+    id: "ezo_disabler_rx"
+    restore_mode: ALWAYS_ON
+    internal: true
+
+  # Disable EZO sensor
+  - platform: gpio
+    name: "TCA9555 P15"
+    pin:
+      tca9555: tca9555_hub
+      number: 13
+      mode: output
+    id: "ezo_disabler_ph"
+    internal: true
+    restore_mode: ALWAYS_ON  
+
+  # Led Boost button
+  - platform: gpio
+    name: "TCA9555 P17"
+    pin:
+      tca9555: tca9555_hub
+      number: 15
+      mode: output
+    id: btnboostLed
+    internal: true
+
+# Switch to enable chlorine dosing
+  - platform: gpio
+    pin: ${gpioChlorineDosing}
+    name: "Chlorine Pump"
+    id: chlorineDosingPump
+    icon: mdi:toggle-switch-off-outline
+    restore_mode: ALWAYS_OFF
+    inverted: true
+    interlock: [acidDosingPump]
+    interlock_wait_time: 30s
+    on_turn_on:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(chlorine_startup_lockout);'
+            then:
+              - logger.log:
+                  format: "Chlorine dosing locked after startup."
+                  level: WARN
+                  tag: dosing
+              - switch.turn_off: chlorineDosingPump
+            else:
+              - lambda: |-
+                  id(last_chlorine_dose) = id(app_runtime);
+                  id(chlorine_pump_state) = true;
+              - delay: 120s
+              - switch.turn_off: chlorineDosingPump
+              - lambda: |-
+                  id(chlorine_pump_state) = false;
+
+# Switch to enable acid dosing
+  - platform: gpio
+    pin: ${gpioAcidDosing}
+    name: "Acid Pump"
+    id: acidDosingPump
+    icon: mdi:toggle-switch-off-outline
+    restore_mode: ALWAYS_OFF
+    inverted: true
+    interlock: [chlorineDosingPump]
+    interlock_wait_time: 30s
+    on_turn_on:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(acid_startup_lockout);'
+            then:
+              - logger.log:
+                  format: "Acid dosing locked after startup."
+                  level: WARN
+                  tag: dosing
+              - switch.turn_off: acidDosingPump
+            else:
+              - lambda: |-
+                  id(last_acid_dose) = id(app_runtime);
+                  id(acid_pump_state) = true;
+              - delay: 180s
+              - switch.turn_off: acidDosingPump
+              - lambda: |-
+                  id(acid_pump_state) = false;
+
+# Switch to ???
+  - platform: gpio
+    pin: ${relay5}
+    name: "Relay 5"
+    id: relais5
+    icon: mdi:toggle-switch-off-outline
+    restore_mode: ALWAYS_OFF
+    inverted: true
+    # on_turn_on:
+    #   then:
+
+# Switch to ???
+  - platform: gpio
+    pin: ${relay6}
+    name: "Relay 6"
+    id: relais6
+    icon: mdi:toggle-switch-off-outline
+    restore_mode: ALWAYS_OFF
+    inverted: true
+    # on_turn_on:
+    #   then:
+
+#  Drive switches
+  - platform: modbus_controller
+    modbus_controller_id: drive
+    id: drive_state
+    name: "Drive State"
+    icon: mdi:toggle-switch-off-outline
+    register_type: holding
+    address: 0
+    bitmask: 1
+    
+  - platform: modbus_controller
+    modbus_controller_id: drive
+    id: drive_fast_stop_request
+    name: "Drive Fast Stop Request"
+    icon: mdi:toggle-switch-off-outline
+    register_type: holding
+    address: 0
+    bitmask: 2
+      
+  - platform: modbus_controller
+    modbus_controller_id: drive
+    id: drive_fault_reset
+    name: "Drive Fault Reset"
+    icon: mdi:toggle-switch-off-outline
+    register_type: holding
+    address: 0
+    bitmask: 4 
+
+  - platform: modbus_controller
+    modbus_controller_id: drive
+    id: drive_scoast_stop_request
+    name: "Drive Coast Stop Request"
+    icon: mdi:toggle-switch-off-outline
+    register_type: holding
+    address: 0
+    bitmask: 8  
+
+# On boot setting of ramp time drive
+  - platform: modbus_controller
+    modbus_controller_id: drive_on_boot_ramp
+    id: driveonbootramp
+    custom_pdu: [0x6, 0x0, 0x3, 0x1, 0xF4, 0x79, 0xDD] # 5 seconds
+
+# Fairland
+#Read coils 0 - Power switch & 1 - Defrost
+  - platform: modbus_controller
+    modbus_controller_id: fairland_controller
+    name: "Fairland State"
+    id: fairland_power
+    icon: mdi:toggle-switch-off-outline
+    register_type: coil
+    address: 0
+
+  - platform: modbus_controller
+    modbus_controller_id: fairland_controller
+    name: Fairland Manual Defrost
+    register_type: coil
+    address: 1
+    disabled_by_default: true
+
+#--------------------------------------------------------------------------------
+# Buttons
+#--------------------------------------------------------------------------------
+button:
+# Restart button
+  - platform: restart
+    name: "Restart"
+    id: restart_esp
+
+# pH buttons
+  - platform: template
+    name: "Calibration pH 7.00 (step 1)"
+    on_press:
+      lambda: !lambda |-
+        id(ezo_ph).set_calibration_point_mid(7.00);
+        id(app_flow) = APP_FLOW_CAL_PH;
+
+  - platform: template
+    name: "Calibration pH 4.00 (step 2)"
+    on_press:
+      lambda: !lambda |-
+        id(ezo_ph).set_calibration_point_low(4.00);
+        id(app_flow) = APP_FLOW_CAL_PH;
+
+  - platform: template
+    name: "Calibration pH 10.00 (step 3)"
+    on_press:
+      - lambda: !lambda |-
+          id(ezo_ph).set_calibration_point_high(10.00);
+          id(app_flow) = APP_FLOW_CAL_PH;
+      - delay: 300s
+      - lambda: |- 
+          id(last_ph_calibration) = id(app_runtime);
+          id(app_flow) = APP_FLOW_HOME;
+
+  - platform: template
+    name: "Clear pH Calibration"
+    on_press:
+      lambda: !lambda |-
+        id(ezo_ph).clear_calibration();
+        id(app_flow) = APP_FLOW_HOME;
+
+  - platform: template
+    name: "Get pH Calibration"
+    on_press:
+      lambda: !lambda |-
+        id(ezo_ph).get_calibration();
+
+  - platform: template
+    name: "Get pH Slope"
+    on_press:
+      lambda: !lambda |-
+        id(ezo_ph).get_slope();
+
+  - platform: template
+    name: "Get pH Device Temperature Compensation"
+    on_press:
+      lambda: !lambda |-
+        id(ezo_ph).get_t();
+
+# Rx buttons
+  - platform: template
+    name: "Calibration Rx 225mV"
+    on_press:
+      - lambda: !lambda |-
+          id(ezo_rx).set_calibration_generic(225);
+          id(app_flow) = APP_FLOW_CAL_RX;
+      - delay: 300s
+      - lambda: !lambda |-
+          id(last_rx_calibration) = id(app_runtime);
+          id(app_flow) = APP_FLOW_HOME;
+
+  - platform: template
+    name: "Clear Rx Calibration"
+    on_press:
+      lambda: !lambda |-
+        id(ezo_rx).clear_calibration();
+        id(app_flow) = APP_FLOW_HOME;
+
+  - platform: template
+    name: "Get Rx Calibration"
+    on_press:
+      lambda: !lambda |-
+        id(ezo_rx).get_calibration();
+
+  - platform: template
+    name: "PLP Sync"
+    on_press:
+      - uart.write:
+          id: uart_light
+          data: "PsS"
+
+  - platform: template
+    name: "PLP Next Scene"
+    id: plp_next_scene_button
+    on_press:
+      - lambda: |-
+          id(uart_light).write_str("PsU");
+          id(current_scene) = plp_scene_wrap(id(current_scene), 1);
+          id(plp_scene_select).publish_state(plp_scenes[id(current_scene)]);
+
+  - platform: template
+    name: "PLP Previous Scene"
+    id: plp_previous_scene_button
+    on_press:
+      - lambda: |-
+          id(uart_light).write_str("PsD");
+          id(current_scene) = plp_scene_wrap(id(current_scene), -1);
+          id(plp_scene_select).publish_state(plp_scenes[id(current_scene)]);
+
+#--------------------------------------------------------------------------------
+# Sensors
+#--------------------------------------------------------------------------------
+sensor:
+# Uptime
+  - platform: uptime
+    id: uptime_seconds
+    
+# wifi signal
+  - platform: wifi_signal
+    id: wifisignal
+    internal: true
+    name: "WiFi Signal"
+    update_interval: never
+
+# wifi copy
+  - platform: copy # Reports the WiFi signal strength in %
+    source_id: wifisignal
+    name: "WiFi Signal"
+    filters:
+      - lambda: return min(max(2 * (x + 100.0), 0.0), 100.0);
+    unit_of_measurement: "%"
+    entity_category: "diagnostic"
+    device_class: ""
+
+# wifi step
+  - platform: template
+    id: wifistep
+    internal: true
+    update_interval: never
+    lambda: |-
+      if (isnan(id(wifisignal).state)) {
+        return 0;
+      }
+      return round((id(wifisignal).state + 100) / 10);
+
+# debug
+  - platform: debug
+    free:
+      name: "Heap Free"
+    block:
+      name: "Heap Max Block"
+    loop_time:
+      name: "Loop Time"
+    psram:
+      name: "Free PSRAM"
+
+# PH sensor
+  - platform: ezo
+    id: ezo_ph
+    name: "pH"
+    icon: mdi:ph
+    address: 99
+    #unit_of_measurement: "pH"
+    device_class: ph
+    update_interval: never
+    accuracy_decimals: 2
+    filters:
+      - lambda: |-
+          constexpr size_t window_size = 10;
+          static float samples[window_size] = {};
+          static size_t next_sample = 0;
+          static size_t sample_count = 0;
+          static size_t values_since_publish = 0;
+          static bool was_calibrating = false;
+
+          const bool calibrating = id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX;
+
+          if (calibrating) {
+            if (!was_calibrating) {
+              sample_count = 0;
+              next_sample = 0;
+              values_since_publish = 0;
+            }
+            was_calibrating = true;
+
+            if (isnan(x)) {
+              return {};
+            }
+            return x;
+          }
+
+          if (was_calibrating) {
+            sample_count = 0;
+            next_sample = 0;
+            values_since_publish = 0;
+            was_calibrating = false;
+          }
+
+          if (isnan(x)) {
+            return {};
+          }
+
+          samples[next_sample] = x;
+          next_sample = (next_sample + 1) % window_size;
+
+          if (sample_count < window_size) {
+            sample_count++;
+          }
+
+          values_since_publish++;
+
+          if (sample_count < window_size || values_since_publish < 10) {
+            return {};
+          }
+
+          values_since_publish = 0;
+
+          float sum = 0.0f;
+          for (size_t i = 0; i < sample_count; i++) {
+            sum += samples[i];
+          }
+
+          return sum / sample_count;
+    on_slope:
+      - lambda: |-
+          id(on_slope_text).publish_state(x);
+    on_calibration:
+      - lambda: |-
+          id(on_calibration_text).publish_state(x);
+    on_t:
+      - lambda: |-
+          id(on_temperature_text).publish_state(x);
+
+# Rx sensor
+  - platform: ezo
+    id: ezo_rx
+    name: "Rx"
+    icon: mdi:water-circle
+    address: 98
+    unit_of_measurement: "mV"
+    device_class: voltage
+    update_interval: never
+    filters:
+      - lambda: |-
+          constexpr size_t window_size = 5;
+          static float samples[window_size] = {};
+          static size_t next_sample = 0;
+          static size_t sample_count = 0;
+          static size_t values_since_publish = 0;
+          static bool was_calibrating = false;
+
+          const bool calibrating = id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX;
+
+          if (calibrating) {
+            if (!was_calibrating) {
+              sample_count = 0;
+              next_sample = 0;
+              values_since_publish = 0;
+            }
+            was_calibrating = true;
+
+            if (isnan(x) || x > 1000) {
+              return {};
+            }
+            return x;
+          }
+
+          if (was_calibrating) {
+            sample_count = 0;
+            next_sample = 0;
+            values_since_publish = 0;
+            was_calibrating = false;
+          }
+
+          if (isnan(x) || x > 1000) {
+            return {};
+          }
+
+          samples[next_sample] = x;
+          next_sample = (next_sample + 1) % window_size;
+
+          if (sample_count < window_size) {
+            sample_count++;
+          }
+
+          values_since_publish++;
+
+          if (sample_count < window_size || values_since_publish < 5) {
+            return {};
+          }
+
+          values_since_publish = 0;
+
+          float sum = 0.0f;
+          for (size_t i = 0; i < sample_count; i++) {
+            sum += samples[i];
+          }
+
+          return sum / sample_count;
+    on_calibration:
+      - lambda: |-
+          id(on_calibration_rx_text).publish_state(x);
+
+# Dallas temperature sensors
+  - platform: dallas_temp
+    id: temp_poolhouse
+    name: "Gardenhouse"
+    icon: mdi:home-thermometer
+    address: 0xcf00000fbdd74b28
+    update_interval: never
+    filters:
+      - filter_out: NaN
+      - filter_out: 0.0
+      #- filter_out: 85
+      - sliding_window_moving_average:
+          window_size: 10
+          send_every: 10
+      - clamp:
+          min_value: -25
+          max_value: 75
+          ignore_out_of_range: true
+
+  - platform: dallas_temp
+    id: temp_from_pool
+    name: "From Pool"
+    icon: "mdi:pool-thermometer"
+    address: 0x3600000fbe279528
+    update_interval: never
+    filters:
+      - filter_out: NaN
+      - filter_out: 0.0
+      #- filter_out: 85
+      - sliding_window_moving_average:
+          window_size: 10
+          send_every: 10
+      - clamp:
+          min_value: -25
+          max_value: 75
+          ignore_out_of_range: true
+
+  - platform: dallas_temp
+    id: temp_from_inverter
+    name: "From Fairland"
+    icon: mdi:thermometer-plus
+    address: 0xf900000fd12d3a28
+    update_interval: never
+    filters:
+      - filter_out: NaN
+      - filter_out: 0.0
+      #- filter_out: 85
+      - sliding_window_moving_average:
+          window_size: 10
+          send_every: 10
+      - clamp:
+          min_value: -25
+          max_value: 75
+          ignore_out_of_range: true
+
+  - platform: dallas_temp
+    id: temp_to_pool
+    name: "To Pool"
+    icon: mdi:thermometer-water
+    address: 0x5e00000fbcdc4928
+    update_interval: never
+    filters:
+      - filter_out: NaN
+      - filter_out: 0.0
+      #- filter_out: 85
+      - sliding_window_moving_average:
+          window_size: 10
+          send_every: 10
+      - clamp:
+          min_value: -25
+          max_value: 75
+          ignore_out_of_range: true
+
+# am2315c i2c temp/hum sensor          
+  - platform: am2315c
+    update_interval: 60s
+    temperature:
+      name: "Outside"
+      icon: mdi:sun-thermometer
+      id: "temp_outside"
+      filters:
+        - filter_out: NaN
+        - filter_out: 0.0
+        - sliding_window_moving_average:
+            window_size: 10
+            send_every: 10
+        - clamp:
+            min_value: -25
+            max_value: 75
+            ignore_out_of_range: true
+    humidity:
+      name: "Outside Humidity"
+      id:  "hum_outside"
+      filters:
+        - filter_out: NaN
+        - filter_out: 0.0
+        - sliding_window_moving_average:
+            window_size: 10
+            send_every: 10
+
+# water flow meter
+  - platform: pulse_counter
+    id: flowmeter_water
+    pin: ${gpioWaterFlow}
+    name: Water Flow
+    unit_of_measurement: 'm3/h'
+    update_interval: never
+    accuracy_decimals: 2
+    filters:
+    - multiply: 0.005 # 1/12 * 60 / 1000
+    - round: 2
+
+# heatpump flow meter
+  - platform: pulse_counter
+    id: flowmeter_heatpump
+    pin: 
+        number: ${gpioHeatpumpFlow}
+        mode:
+          input: true
+          pulldown: true
+    name: Fairland Flow
+    unit_of_measurement: 'm3/h'
+    update_interval: never
+    accuracy_decimals: 2
+    filters:
+    - multiply: 0.005 # 1/12 * 60 / 1000
+    - round: 2
+
+# drive err num
+  - platform: modbus_controller
+    modbus_controller_id: drive
+    name: "Drive Err Num"
+    id: drive_errnum
+    register_type: holding
+    address: 5
+    unit_of_measurement: ""
+    value_type: U_WORD
+
+# Drive sensors
+  - platform: modbus_controller
+    modbus_controller_id: drive
+    name: "Drive Output FREQ"
+    id: out_freq
+    register_type: holding
+    address: 6
+    unit_of_measurement: "Hz"
+    value_type: S_WORD
+    filters:
+    - multiply: 0.1
+
+# drive current
+  - platform: modbus_controller
+    modbus_controller_id: drive
+    name: "Drive Output Current"
+    id: out_curr
+    register_type: holding
+    address: 7
+    unit_of_measurement: "A"
+    value_type: U_WORD
+    filters:
+    - multiply: 0.1
+
+# drive temp
+  - platform: modbus_controller
+    modbus_controller_id: drive
+    name: "Drive Temperature"
+    id: drive_temp
+    register_type: holding
+    address: 23
+    unit_of_measurement: "°C"
+    value_type: U_WORD
+    reuse_previous_range: true
+
+# Fairland pulse counter Kwh
+  - platform: pulse_counter
+    pin: 
+      number: ${gpioFairlandkWh}
+      mode:
+        input: true
+        pullup: true
+    name: "Fairland power"
+    id: fairland_pulse_counter
+    unit_of_measurement: "W"
+    icon: "mdi:flash"
+    update_interval: never
+    accuracy_decimals: 1
+    device_class: power
+    state_class: measurement
+    filters:
+      - multiply: 60  # Convert Wh to kWh (1 pulse = 1Wh)
+    total:
+      name: Fairland energy
+      unit_of_measurement: kWh
+      id: fairland_pulse_counter_total
+      accuracy_decimals: 3
+      device_class: energy
+      state_class: total_increasing
+      filters:
+        - multiply: 0.001
+
+# Flair pulse counter Kwh 
+  - platform: pulse_counter
+    pin: 
+      number: ${gpioFlairkWh}
+      mode:
+        input: true
+        pullup: true
+    name: "Flair power"
+    id: flair_pulse_counter
+    unit_of_measurement: "W"
+    icon: "mdi:flash"
+    update_interval: never
+    accuracy_decimals: 1
+    device_class: power
+    state_class: measurement
+    filters:
+      - multiply: 60  # Convert Wh to kWh (1 pulse = 1Wh)
+    total:
+      name: "Flair energy"
+      unit_of_measurement: "kWh"
+      id: flair_pulse_counter_total
+      accuracy_decimals: 3
+      device_class: energy
+      state_class: total_increasing
+      filters:
+        - multiply: 0.001
+
+#Fairland 
+# Compressor Speed
+  - platform: modbus_controller
+    modbus_controller_id: fairland_controller
+    name: Fairland Compressor Speed
+    id: fairland_compressor_speed
+    unit_of_measurement: '%'
+    register_type: read
+    address: 0
+    value_type: U_WORD
+
+# Compressor target frequency
+  - platform: modbus_controller
+    modbus_controller_id: fairland_controller
+    name: Fairland Compressor Target Frequency
+    unit_of_measurement: 'Hz'
+    register_type: read
+    address: 1
+    value_type: U_WORD
+    device_class: frequency
+    entity_category: diagnostic
+
+# Water Inlet Temperature
+  - platform: modbus_controller
+    modbus_controller_id: fairland_controller
+    name: Fairland Water Inlet
+    id: fairland_water_inlet
+    unit_of_measurement: '°C'
+    register_type: read
+    address: 3
+    value_type: U_WORD
+    reuse_previous_range: false
+    device_class: temperature
+    filters:
+      - offset: -60
+      - multiply: 0.5
+    accuracy_decimals: 1
+
+# Water Outlet Temperature
+  - platform: modbus_controller
+    modbus_controller_id: fairland_controller
+    name: Fairland Water Outlet
+    id: fairland_water_outlet
+    unit_of_measurement: '°C'
+    register_type: read
+    address: 4
+    value_type: U_WORD
+    device_class: temperature
+    filters:
+      - offset: -60
+      - multiply: 0.5
+    accuracy_decimals: 1
+
+# Ambient Temperature
+  - platform: modbus_controller
+    modbus_controller_id: fairland_controller
+    name: Fairland Ambient Temperature
+    unit_of_measurement: '°C'
+    register_type: read
+    address: 5
+    value_type: U_WORD
+    device_class: temperature
+    filters:
+      - offset: -60
+      - multiply: 0.5
+    accuracy_decimals: 1
+
+# frequency
+  - platform: modbus_controller
+    modbus_controller_id: fairland_controller
+    name: Fairland Compressor Frequency
+    id: fairland_compressor_frequency
+    unit_of_measurement: 'Hz'
+    register_type: read
+    address: 10
+    value_type: U_WORD
+    device_class: frequency
+
+  # Fan speed
+  - platform: modbus_controller
+    modbus_controller_id: fairland_controller
+    name: Fairland DC Fan Motor Speed
+    unit_of_measurement: 'RPM'
+    register_type: read
+    address: 14
+    value_type: U_WORD
+
+#--------------------------------------------------------------------------------
+# Numbers
+#--------------------------------------------------------------------------------
+number: 
+# Drive Ramp time
+  - platform: modbus_controller
+    modbus_controller_id: drive
+    id: drive_ramp_set
+    name: "Drive Ramp TIME"
+    address: 3
+    value_type: U_WORD
+    multiply: 100
+    unit_of_measurement: 's'
+    icon: mdi:sine-wave
+    min_value: 5
+    max_value: 15
+    step: 1
+    mode: 'slider' 
+
+# slider to adjust Rx value
+  - platform: template
+    id: set_rx_level
+    name: "Set Rx Level"
+    unit_of_measurement: 'mV'
+    update_interval: never
+    optimistic: true
+    min_value: 675
+    max_value: 1000
+    step: 25
+    mode: 'slider' 
+    set_action: 
+      then:
+        - lambda: id(rx_expected_value) = x;
+
+# slider to adjust pH value
+  - platform: template
+    id: set_ph_level
+    name: "Set pH Level"
+    unit_of_measurement: 'pH'
+    update_interval: never
+    optimistic: true
+    min_value: 7.0
+    max_value: 7.8
+    step: 0.1
+    mode: 'slider' 
+    set_action: 
+      then:
+        - lambda: id(ph_expected_value) = x;
+
+# slider to adjust freeze temp detection value
+  - platform: template
+    id: set_freeze_temp
+    name: "Set freeze temp"
+    unit_of_measurement: 'C'
+    update_interval: never
+    optimistic: true
+    internal: true
+    restore_value: true
+    min_value: -5.0
+    max_value: 5.0
+    step: 1
+    mode: 'slider' 
+    set_action: 
+      then:
+        - lambda: id(freeze_detection_temp) = x;
+
+# Fairland
+  - platform: modbus_controller
+    modbus_controller_id: fairland_controller
+    name: Fairland Setpoint
+    id: heatpump_setpoint
+    unit_of_measurement: "°C"
+    device_class: temperature
+    address: 3
+    reuse_previous_range: false
+    value_type: U_WORD
+    min_value: 18  # docs say 12
+    max_value: 40
+    lambda: "return (x - 60)/2;"
+    write_lambda: "return ((x * 2) + 60);"
+
+#--------------------------------------------------------------------------------
+# Binary Sensors
+#--------------------------------------------------------------------------------
+binary_sensor:
+# Drive status
+  - platform: modbus_controller
+    modbus_controller_id: drive
+    name: "Drive Status"
+    register_type: read
+    address: 5
+    bitmask: 0x1
+
+# Drive tripped
+  - platform: modbus_controller
+    modbus_controller_id: drive
+    name: "Drive Tripped"
+    id: drive_tripped
+    register_type: read
+    address: 5
+    bitmask: 0x2
+
+# Drive standby
+  - platform: modbus_controller
+    modbus_controller_id: drive
+    name: "Drive Standby Mode"
+    register_type: read
+    address: 5
+    bitmask: 0x32
+
+# Drive ready
+  - platform: modbus_controller
+    modbus_controller_id: drive
+    name: "Drive Ready"
+    register_type: read
+    address: 5
+    bitmask: 0x64
+
+# restart button
+  - platform: gpio
+    pin:
+      number: ${gpioRestartButton}
+      mode: 
+        input: true
+        pullup: true  
+    internal: true
+    id: restart_button
+    on_press:
+      then:
+        - lambda: 
+            id(restart_esp).press();
+
+# Boost button
+  - platform: gpio
+    name: "Boost" #TCA9555 P16
+    pin:
+      tca9555: tca9555_hub
+      number: 14
+      mode: input
+      inverted: true  
+    internal: true
+    id: boost_button
+    use_interrupt: false
+    on_press:
+      then:
+        - select.set:
+            id: drive_freq_set
+            option: "50 Hz"
+        - lambda: 'id(app_flow) = APP_FLOW_BOOST;'
+        - switch.turn_on: btnboostLed
+        - display.page.show: page10
+    on_release:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(season_selector).current_option() != "Winter";'
+            then:
+              - select.set:
+                  id: drive_freq_set
+                  option: "37 Hz"
+            else:
+              - select.set:
+                  id: drive_freq_set
+                  option: "25 Hz"
+        - lambda: 'id(app_flow) = APP_FLOW_HOME;'
+        - switch.turn_off: btnboostLed
+        - display.page.show: page1
+        
+
+# PIR sensor
+  - platform: gpio
+    id: pir
+    internal: true
+    name: pir_sensor
+    pin:
+      number: ${gpioPir}
+      mode: INPUT_PULLUP
+    filters:
+      - delayed_on: 50ms
+    on_press:
+      - if:
+          # Only respond to the PIR if the screen is off
+          condition:
+            lambda: |-
+              return (id(app_flow) == APP_FLOW_OFF);
+          then:
+            - lambda: |-
+                id(app_flow) = APP_FLOW_HOME;
+                id(pir_time) = 0;
+            - light.turn_on: lcd_backlight_light
+
+# Fairland
+  - platform: modbus_controller
+    modbus_controller_id: fairland_controller
+    name: Fairland Power Status
+    id: fairland_power_status
+    register_type: discrete_input
+    address: 0
+    device_class: power
+
+# Defrost Status
+  - platform: modbus_controller
+    modbus_controller_id: fairland_controller
+    name: Fairland Defrost Status
+    register_type: discrete_input
+    address: 1
+    device_class: cold
+
+# Water Flow (D3)
+  - platform: modbus_controller
+    modbus_controller_id: fairland_controller
+    name: Fairland Water Flow (D3)
+    register_type: discrete_input
+    address: 4
+    id: water_flow_fairland
+    on_state:
+      then:
+        - lambda: |-
+            ESP_LOGD("test", "Sensor state changed: %s", id(water_flow_fairland).state ? "ON" : "OFF");
+
+# Fault / Error
+  - platform: modbus_controller
+    modbus_controller_id: fairland_controller
+    name: Fairland Error
+    register_type: discrete_input
+    address: 16
+    device_class: problem
+    entity_category: diagnostic
+
+# Compressor Running
+  - platform: modbus_controller
+    modbus_controller_id: fairland_controller
+    name: Fairland Compressor Running
+    id: fairland_compressor_running
+    register_type: discrete_input
+    address: 17
+    device_class: running
+
+# touchscreen buttons:
+  - platform: touchscreen
+    name: Menu button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page1]
+    x_min: 20
+    x_max: 90
+    y_min: 240
+    y_max: 310
+    on_release:
+        - if:
+            condition:
+              display.is_displaying_page: page1
+            then:
+            - display.page.show: page2
+
+# touchscreen next menu button
+  - platform: touchscreen
+    name: next menu button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page2]
+    x_min: 20
+    x_max: 90
+    y_min: 240
+    y_max: 310
+    on_release:
+        - if:
+            condition:
+              display.is_displaying_page: page2
+            then:
+            - display.page.show: page7
+
+# touchscreen pool cover button
+  - platform: touchscreen
+    name: pool cover button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page7]
+    x_min: 140
+    x_max: 210
+    y_min: 150
+    y_max: 220
+    on_release:
+      - if:
+          condition:
+            display.is_displaying_page: page7
+          then:
+            - display.page.show: page13
+
+  - platform: touchscreen
+    name: Device info button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page7]
+    x_min: 20
+    x_max: 90
+    y_min: 240
+    y_max: 310
+    on_release:
+      - if:
+          condition:
+            display.is_displaying_page: page7
+          then:
+            - display.page.show: page14
+
+# touchscreen back button — mapping lives in navigate_back script
+  - platform: touchscreen
+    name: Back button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page2, page3 ,page3_1 ,page3_2 ,page3_3, page4, page4_1, page4_2, page4_3, page4_4, page5, page5_1_1, page5_1_2, page5_1_3, page5_1_4, page5_2, page6, page6_1_1, page6_1_2, page6_2, page7, page8, page11, page12, page13, page14]
+    x_min: 150
+    x_max: 220
+    y_min: 240
+    y_max: 310
+    on_press:
+        - script.execute: navigate_back
+
+# touchscreen pump button
+  - platform: touchscreen
+    name: pump button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page2]
+    x_min: 20
+    x_max: 90
+    y_min: 70
+    y_max: 140
+    on_release:
+      - if:
+          condition:
+            display.is_displaying_page: page2
+          then:
+          - display.page.show: page3
+      
+# touchscreen invertek drive start time 
+  - platform: touchscreen
+    name: Start time
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page3]
+    x_min: 60
+    x_max: 180
+    y_min: 70
+    y_max: 110
+    on_release:
+      - if:
+          condition:
+            display.is_displaying_page: page3
+          then:
+          - display.page.show: page3_1
+
+# touchscreen invertek drive end time
+  - platform: touchscreen
+    name: End time
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page3]
+    x_min: 60
+    x_max: 180
+    y_min: 130
+    y_max: 170
+    on_release:
+      - if:
+          condition:
+            display.is_displaying_page: page3
+          then:
+          - display.page.show: page3_2
+
+# touchscreen invertek drive frequency
+  - platform: touchscreen
+    name: Frequency
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page3]
+    x_min: 60
+    x_max: 180
+    y_min: 190
+    y_max: 230
+    on_release:
+      - if:
+          condition:
+            display.is_displaying_page: page3
+          then:
+          - display.page.show: page3_3
+
+# touchscreen low speed pump button
+  - platform: touchscreen
+    name: low speed button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page3_3]
+    x_min: 70
+    x_max: 170
+    y_min: 70
+    y_max: 110
+    on_press:
+      - select.set:
+          id: drive_freq_set
+          option: "25 Hz"
+
+# touchscreen medium speed pump button
+  - platform: touchscreen
+    name: medium speed button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page3_3]
+    x_min: 70
+    x_max: 170
+    y_min: 130
+    y_max: 170
+    on_press:
+      - select.set:
+          id: drive_freq_set
+          option: "37 Hz"
+
+# touchscreen full speed pump button
+  - platform: touchscreen
+    name: full speed button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page3_3]
+    x_min: 70
+    x_max: 170
+    y_min: 190
+    y_max: 230
+    on_press:
+      - select.set:
+          id: drive_freq_set
+          option: "50 Hz"
+
+# touchscreen heatpump button
+  - platform: touchscreen
+    name: Heatpump button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page2]
+    x_min: 140
+    x_max: 210
+    y_min: 70
+    y_max: 140
+    on_release:
+      - display.page.show: page4
+
+# touchscreen ph button
+  - platform: touchscreen
+    name: ph button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page2]
+    x_min: 20
+    x_max: 90
+    y_min: 150
+    y_max: 220
+    on_press:
+      - display.page.show: page5
+
+# touchscreen Rx button
+  - platform: touchscreen
+    name: Rx button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page2]
+    x_min: 140
+    x_max: 210
+    y_min: 150
+    y_max: 220
+    on_press:
+      - display.page.show: page6
+
+# touchscreen Fairland start time 
+  - platform: touchscreen
+    name: Start time
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page4]
+    x_min: 20
+    x_max: 110
+    y_min: 70
+    y_max: 110
+    on_release:
+      - if:
+          condition:
+            display.is_displaying_page: page4
+          then:
+          - display.page.show: page4_1
+
+# touchscreen Fairland end time
+  - platform: touchscreen
+    name: End time
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page4]
+    x_min: 130
+    x_max: 220
+    y_min: 70
+    y_max: 110
+    on_release:
+      - if:
+          condition:
+            display.is_displaying_page: page4
+          then:
+          - display.page.show: page4_2
+
+# touchscreen fairland setpoint
+  - platform: touchscreen
+    name: setpoint
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page4]
+    x_min: 20
+    x_max: 110
+    y_min: 130
+    y_max: 170
+    on_release:
+      - if:
+          condition:
+            display.is_displaying_page: page4
+          then:
+          - display.page.show: page4_3
+
+# touchscreen Fairland mode menu
+  - platform: touchscreen
+    name: Mode
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page4]
+    x_min: 130
+    x_max: 220
+    y_min: 130
+    y_max: 170
+    on_release:
+      - if:
+          condition:
+            display.is_displaying_page: page4
+          then:
+          - display.page.show: page4_4
+
+# touchscreen Fairland mode selection
+  - platform: touchscreen
+    name: Smart mode
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page4_4]
+    x_min: 45
+    x_max: 195
+    y_min: 70
+    y_max: 110
+    on_release:
+      - select.set:
+          id: fairland_working_mode
+          option: "Smart"
+
+  - platform: touchscreen
+    name: Silence mode
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page4_4]
+    x_min: 45
+    x_max: 195
+    y_min: 130
+    y_max: 170
+    on_release:
+      - select.set:
+          id: fairland_working_mode
+          option: "Silence"
+
+  - platform: touchscreen
+    name: Super Silence mode
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page4_4]
+    x_min: 45
+    x_max: 195
+    y_min: 190
+    y_max: 230
+    on_release:
+      - select.set:
+          id: fairland_working_mode
+          option: "Super Silence"
+
+# touchscreen calibration 
+  - platform: touchscreen
+    name: calibration
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page5, page6]
+    x_min: 60
+    x_max: 180
+    y_min: 70
+    y_max: 110
+    on_press:
+      - if:
+          condition:
+            display.is_displaying_page: page5
+          then:
+          - display.page.show: page5_1_1
+          - lambda: id(app_flow) = APP_FLOW_CAL_PH;
+      - if:
+          condition:
+            display.is_displaying_page: page6
+          then:
+          - display.page.show: page6_1_1
+          - lambda: id(app_flow) = APP_FLOW_CAL_RX;
+
+# touchscreen set level page
+  - platform: touchscreen
+    name: set level
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page5, page6]
+    x_min: 60
+    x_max: 180
+    y_min: 130
+    y_max: 170
+    on_press:
+      - if:
+          condition:
+            display.is_displaying_page: page5
+          then:
+          - display.page.show: page5_2
+      - if:
+          condition:
+            display.is_displaying_page: page6
+          then:
+          - display.page.show: page6_2
+
+# touchscreen pH calibration okay button — handled by calibration_ok script
+  - platform: touchscreen
+    name: pH calibration ok button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page5_1_1, page5_1_2, page5_1_3]
+    x_min: 20
+    x_max: 90
+    y_min: 140
+    y_max: 210
+    on_release:
+        - if:
+            condition:
+              display.is_displaying_page: page5_1_1
+            then:
+              - script.execute:
+                  id: calibration_ok
+                  step: 1
+        - if:
+            condition:
+              display.is_displaying_page: page5_1_2
+            then:
+              - script.execute:
+                  id: calibration_ok
+                  step: 2
+        - if:
+            condition:
+              display.is_displaying_page: page5_1_3
+            then:
+              - script.execute:
+                  id: calibration_ok
+                  step: 3
+
+# touchscreen pH calibration finish button (delay + timestamp stay here, not in restart script)
+  - platform: touchscreen
+    name: pH calibration finish button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page5_1_4]
+    x_min: 20
+    x_max: 90
+    y_min: 140
+    y_max: 210
+    on_release:
+        - if:
+            condition:
+              display.is_displaying_page: page5_1_4
+            then:
+            - display.page.show: page5
+            - delay: 300s
+            - lambda: |-
+                id(last_ph_calibration) = id(app_runtime);
+                id(app_flow) = APP_FLOW_HOME;
+
+# touchscreen Rx calibration okay button — handled by calibration_ok script
+  - platform: touchscreen
+    name: Rx calibration ok button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page6_1_1]
+    x_min: 20
+    x_max: 90
+    y_min: 140
+    y_max: 210
+    on_release:
+        - if:
+            condition:
+              display.is_displaying_page: page6_1_1
+            then:
+              - script.execute:
+                  id: calibration_ok
+                  step: 5
+
+# touchscreen Rx calibration finish button (delay + timestamp stay here, not in restart script)
+  - platform: touchscreen
+    name: Rx calibration finish button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page6_1_2]
+    x_min: 20
+    x_max: 90
+    y_min: 140
+    y_max: 210
+    on_release:
+        - if:
+            condition:
+              display.is_displaying_page: page6_1_2
+            then:
+            - display.page.show: page6
+            - delay: 300s
+            - lambda: |-
+                id(last_rx_calibration) = id(app_runtime);
+                id(app_flow) = APP_FLOW_HOME;
+
+ # touchscreen value up button (shared by setpoint pages)
+  - platform: touchscreen
+    name: value up button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page4_3, page5_2, page6_2, page8]
+    x_min: 20
+    x_max: 90
+    y_min: 70
+    y_max: 140
+    on_press:
+      - script.execute:
+          id: adjust_screen_value
+          direction: 1
+
+ # touchscreen value down button (shared by setpoint pages)
+  - platform: touchscreen
+    name: value down button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page4_3, page5_2, page6_2, page8]
+    x_min: 20
+    x_max: 90
+    y_min: 150
+    y_max: 220
+    on_press:
+      - script.execute:
+          id: adjust_screen_value
+          direction: -1
+
+# touchscreen snowflake button
+  - platform: touchscreen
+    name: snowflake button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page7]
+    x_min: 20
+    x_max: 90
+    y_min: 70
+    y_max: 140
+    on_press:
+      - if:
+          condition:
+            display.is_displaying_page: page7
+          then:
+          - display.page.show: page8
+
+# touchscreen pool-light menu button
+  - platform: touchscreen
+    name: Pool light menu button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page7]
+    x_min: 140
+    x_max: 210
+    y_min: 70
+    y_max: 140
+    on_release:
+      - display.page.show: page11
+
+# touchscreen season selector menu button
+  - platform: touchscreen
+    name: Season selector menu button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page7]
+    x_min: 20
+    x_max: 90
+    y_min: 150
+    y_max: 220
+    on_release:
+      - display.page.show: page12
+
+# touchscreen season selection
+  - platform: touchscreen
+    name: Fall season
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page12]
+    x_min: 20
+    x_max: 110
+    y_min: 70
+    y_max: 110
+    on_release:
+      - select.set:
+          id: season_selector
+          option: "Fall"
+
+  - platform: touchscreen
+    name: Spring season
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page12]
+    x_min: 130
+    x_max: 220
+    y_min: 70
+    y_max: 110
+    on_release:
+      - select.set:
+          id: season_selector
+          option: "Spring"
+
+  - platform: touchscreen
+    name: Summer season
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page12]
+    x_min: 20
+    x_max: 110
+    y_min: 130
+    y_max: 170
+    on_release:
+      - select.set:
+          id: season_selector
+          option: "Summer"
+
+  - platform: touchscreen
+    name: Winter season
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page12]
+    x_min: 130
+    x_max: 220
+    y_min: 130
+    y_max: 170
+    on_release:
+      - select.set:
+          id: season_selector
+          option: "Winter"
+
+# page 11: pool-light controls
+  - platform: touchscreen
+    name: Pool lights on button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page11]
+    x_min: 45
+    x_max: 115
+    y_min: 70
+    y_max: 110
+    on_press:
+      - light.turn_on: pool_lights
+
+  - platform: touchscreen
+    name: Pool lights off button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page11]
+    x_min: 125
+    x_max: 195
+    y_min: 70
+    y_max: 110
+    on_press:
+      - light.turn_off: pool_lights
+
+  - platform: touchscreen
+    name: PLP next scene button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page11]
+    x_min: 45
+    x_max: 195
+    y_min: 130
+    y_max: 170
+    on_press:
+      - button.press: plp_next_scene_button
+
+  - platform: touchscreen
+    name: PLP previous scene button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page11]
+    x_min: 45
+    x_max: 195
+    y_min: 190
+    y_max: 230
+    on_press:
+      - button.press: plp_previous_scene_button
+
+# touchscreen value buttons handled by adjust_screen_value script
+
+# touchscreen time picker buttons handled by adjust_screen_time script
+  - platform: touchscreen
+    name: time up hour button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page3_1, page3_2, page4_1, page4_2]
+    x_min: 20
+    x_max: 90
+    y_min: 70
+    y_max: 140
+    on_press:
+      - script.execute:
+          id: adjust_screen_time
+          hour_delta: 1
+          minute_delta: 0
+
+  - platform: touchscreen
+    name: time down hour button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page3_1, page3_2, page4_1, page4_2]
+    x_min: 20
+    x_max: 90
+    y_min: 170
+    y_max: 250
+    on_press:
+      - script.execute:
+          id: adjust_screen_time
+          hour_delta: -1
+          minute_delta: 0
+
+  - platform: touchscreen
+    name: time up minute button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page3_1, page3_2, page4_1, page4_2]
+    x_min: 100
+    x_max: 170
+    y_min: 70
+    y_max: 140
+    on_press:
+      - script.execute:
+          id: adjust_screen_time
+          hour_delta: 0
+          minute_delta: 1
+
+  - platform: touchscreen
+    name: time down minute button
+    touchscreen_id: my_touchscreen
+    internal: true
+    pages: [page3_1, page3_2, page4_1, page4_2]
+    x_min: 100
+    x_max: 170
+    y_min: 170
+    y_max: 250
+    on_press:
+      - script.execute:
+          id: adjust_screen_time
+          hour_delta: 0
+          minute_delta: -1
+
+#--------------------------------------------------------------------------------
+# Text sensors
+#--------------------------------------------------------------------------------
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: Device IP Address
+      id: device_ip_address
+# uptime
+  - platform: template
+    name: Uptime
+    id: uptime_text
+    update_interval: never
+    icon: mdi:clock-start
+    lambda: |-
+      int seconds = (id(uptime_seconds).state);
+      int days = seconds / (24 * 3600);
+      seconds = seconds % (24 * 3600);
+      int hours = seconds / 3600;
+      seconds = seconds % 3600;
+      int minutes = seconds /  60;
+      seconds = seconds % 60;
+      if ( days ) {
+        return { (std::to_string(days) +"d " + std::to_string(hours) +"h " + std::to_string(minutes) +"m "+ std::to_string(seconds) +"s").c_str() };
+      } else if ( hours ) {
+        return { (std::to_string(hours) +"h " + std::to_string(minutes) +"m "+ std::to_string(seconds) +"s").c_str() };
+      } else if ( minutes ) {
+        return { (std::to_string(minutes) +"m "+ std::to_string(seconds) +"s").c_str() };
+      } else {
+        return { (std::to_string(seconds) +"s").c_str() };
+      }
+
+# pH text sensors
+  - platform: template
+    name: pH on calibration
+    update_interval: never
+    id: on_calibration_text
+
+  - platform: template
+    name: pH on temperature
+    update_interval: never
+    id: on_temperature_text
+
+  - platform: template
+    name: pH on slope
+    update_interval: never
+    id: on_slope_text
+
+# Rx text sensors
+  - platform: template
+    name: Rx on calibration
+    update_interval: never
+    id: on_calibration_rx_text
+
+# debug
+  - platform: debug
+    reset_reason:
+      name: "Reset Reason"
+      id: device_reset_reason
+
+#--------------------------------------------------------------------------------
+# Selects
+#-------------------------------------------------------------------------------- 
+select:
+# select logger level  
+  - platform: logger
+    name: "Logger select"
+
+# Drive frequency selector
+  - platform: modbus_controller
+    modbus_controller_id: drive
+    id: drive_freq_set
+    name: "Drive Frequency"
+    address: 1
+    value_type: U_WORD
+    icon: mdi:sine-wave
+    optimistic: true
+    optionsmap:
+      '25 Hz': 250
+      '37 Hz': 370
+      '50 Hz': 500
+
+#function mode
+  - platform: modbus_controller
+    modbus_controller_id: fairland_controller
+    name: Fairland Function
+    address: 0
+    value_type: U_WORD
+    optimistic: true
+    optionsmap:
+      'Auto': 0
+      'Heating': 1
+      'Cooling': 2
+    disabled_by_default: true
+
+# Working mode
+  - platform: modbus_controller
+    modbus_controller_id: fairland_controller
+    name: Fairland Mode
+    id: fairland_working_mode
+    address: 1
+    value_type: U_WORD
+    optimistic: true
+    optionsmap:
+      'Smart': 0
+      'Silence': 1
+      'Super Silence': 2
+
+# plp scene select
+  - platform: template
+    id: plp_scene_select
+    name: "PLP Scene"
+    optimistic: true
+    options:
+      - "Deep Blue Sea"
+      - "Daylight Blue"
+      - "Sunset"
+      - "Love Is In The Air"
+      - "Forest Spring"
+      - "Think Pink"
+      - "Sunshine"
+      - "Jungle Beach"
+      - "Voodoo"
+      - "Disco"
+      - "Party"
+      - "Warm White"
+      - "Neutral White"
+      - "Sun White"
+    set_action:
+      - lambda: |-
+          int idx = 0;
+          for (int i = 0; i < PLP_SCENE_COUNT; i++) {
+            if (x == plp_scenes[i]) { idx = i; break; }
+          }
+          id(uart_light).write_str(plp_scene_cmd(idx));
+          ESP_LOGI("plp", "TX SCENE: %s", plp_scene_cmd(idx));
+          id(current_scene) = idx;  // keep internal scene index in sync
+
+# PLP color temperature selector
+  - platform: template
+    name: "PLP Color Temperature"
+    optimistic: true
+    options:
+      - "3000K"
+      - "3500K"
+      - "4000K"
+      - "4500K"
+      - "5000K"
+      - "5500K"
+      - "6000K"
+      - "6500K"
+      - "7000K"
+      - "7500K"
+      - "8000K"
+      - "8500K"
+      - "9000K"
+      - "9500K"
+      - "10000K"
+      - "10500K" 
+    set_action:
+      - lambda: |-
+          std::map<std::string, std::string> temp_map = {
+            {"3000K", "PT030"},
+            {"3500K", "PT035"},
+            {"4000K", "PT040"},
+            {"4500K", "PT045"},
+            {"5000K", "PT050"},
+            {"5500K", "PT055"},
+            {"6000K", "PT060"},
+            {"6500K", "PT065"},
+            {"7000K", "PT070"},
+            {"7500K", "PT075"},
+            {"8000K", "PT080"},
+            {"8500K", "PT085"},
+            {"9000K", "PT090"},
+            {"9500K", "PT095"},
+            {"10000K", "PT100"},
+            {"10500K", "PT105"}
+          };
+          if (temp_map.count(x)) {
+            id(uart_light).write_str(temp_map[x].c_str());
+            ESP_LOGI("plp", "TX TEMP: %s", temp_map[x].c_str());
+          }
+
+# Summer / winter mode
+  - platform: template
+    name: "Season selector"
+    id: "season_selector"
+    optimistic: true
+    options:
+      - Fall
+      - Spring
+      - Summer
+      - Winter
+    initial_option: Summer
+    restore_value: true
+
+#--------------------------------------------------------------------------------
+# Scripts
+#--------------------------------------------------------------------------------
+script:
+  #########################################################
+  # PLP scripts
+  #########################################################
+  - id: plp_send_on
+    then:
+      - lambda: |-
+          id(uart_light).write_str("PL1");
+          ESP_LOGI("plp", "TX ON: PL1");
+
+  - id: plp_send_off
+    then:
+      - lambda: |-
+          id(uart_light).write_str("PL0");
+          ESP_LOGI("plp", "TX OFF: PL0");
+
+  - id: plp_send_brightness
+    then:
+      - lambda: |-
+          int bri = id(last_sent_bri);
+          if (bri < 0) bri = 0;
+          if (bri > 100) bri = 100;
+          char cmd[8];
+          sprintf(cmd, "PD%03d", bri);
+          id(uart_light).write_str(cmd);
+          ESP_LOGI("plp", "TX BRI: %s", cmd);
+
+  - id: plp_send_rgb
+    then:
+      - lambda: |-
+          char cmd[20];
+          sprintf(cmd, "PC%03d%03d%03d", id(base_r), id(base_g), id(base_b));
+          id(uart_light).write_str(cmd);
+          ESP_LOGI("plp", "TX RGB: %s", cmd);
+    
+  #########################################################
+  # Set drive start time based on time picker
+  #########################################################
+  - id: adjust_drive_start_time
+    mode: restart
+    parameters:
+      hour_delta: int
+      minute_delta: int
+    then:
+      - datetime.time.set:
+          id: start_time_drive
+          time: !lambda |-
+            uint8_t hour = (id(start_time_drive).hour + hour_delta + 24) % 24;
+            uint8_t minute = (id(start_time_drive).minute + minute_delta + 60) % 60;
+            return {.minute = minute, .hour = hour};
+  
+  #########################################################
+  # Set drive end time based on time picker
+  #########################################################
+  - id: adjust_drive_end_time
+    mode: restart
+    parameters:
+      hour_delta: int
+      minute_delta: int
+    then:
+      - datetime.time.set:
+          id: end_time_drive
+          time: !lambda |-
+            uint8_t hour = (id(end_time_drive).hour + hour_delta + 24) % 24;
+            uint8_t minute = (id(end_time_drive).minute + minute_delta + 60) % 60;
+            return {.minute = minute, .hour = hour};
+  #########################################################
+  # Set fairland start time based on time picker
+  #########################################################
+
+  - id: adjust_fairland_start_time
+    mode: restart
+    parameters:
+      hour_delta: int
+      minute_delta: int
+    then:
+      - datetime.time.set:
+          id: start_time_fairland
+          time: !lambda |-
+            uint8_t hour = (id(start_time_fairland).hour + hour_delta + 24) % 24;
+            uint8_t minute = (id(start_time_fairland).minute + minute_delta + 60) % 60;
+            return {.minute = minute, .hour = hour};
+  #########################################################
+  # Set fairland end time based on time picker
+  #########################################################
+  - id: adjust_fairland_end_time
+    mode: restart
+    parameters:
+      hour_delta: int
+      minute_delta: int
+    then:
+      - datetime.time.set:
+          id: end_time_fairland
+          time: !lambda |-
+            uint8_t hour = (id(end_time_fairland).hour + hour_delta + 24) % 24;
+            uint8_t minute = (id(end_time_fairland).minute + minute_delta + 60) % 60;
+            return {.minute = minute, .hour = hour};
+
+  #########################################################
+  # Shared dispatch: touchscreen value buttons on setpoint pages.
+  # Active page decides which value the +/- buttons adjust.
+  #########################################################
+  - id: adjust_screen_value
+    mode: restart
+    parameters:
+      direction: int   # +1 or -1
+    then:
+      - if:
+          condition:
+            display.is_displaying_page: page4_3
+          then:
+            - lambda: |-
+                float sp = id(heatpump_setpoint).state;
+                auto call = id(heatpump_setpoint).make_call();
+                call.set_value(sp + (direction * 1));
+                call.perform();
+      - if:
+          condition:
+            display.is_displaying_page: page5_2
+          then:
+            - lambda: |-
+                float ph = id(ph_expected_value);
+                auto call = id(set_ph_level).make_call();
+                call.set_value(ph + (direction * 0.1));
+                call.perform();
+      - if:
+          condition:
+            display.is_displaying_page: page6_2
+          then:
+            - lambda: |-
+                int rx = id(rx_expected_value);
+                auto call = id(set_rx_level).make_call();
+                call.set_value(rx + (direction * 25));
+                call.perform();
+      - if:
+          condition:
+            display.is_displaying_page: page8
+          then:
+            - lambda: |-
+                float temp = id(freeze_detection_temp);
+                auto call = id(set_freeze_temp).make_call();
+                call.set_value(temp + (direction * 1));
+                call.perform();
+
+  #########################################################
+  # Shared dispatch: touchscreen time picker buttons.
+  # Active page decides which datetime is adjusted.
+  #########################################################
+  - id: adjust_screen_time
+    mode: restart
+    parameters:
+      hour_delta: int
+      minute_delta: int
+    then:
+      - if:
+          condition:
+            display.is_displaying_page: page3_1
+          then:
+            - script.execute:
+                id: adjust_drive_start_time
+                hour_delta: !lambda 'return hour_delta;'
+                minute_delta: !lambda 'return minute_delta;'
+      - if:
+          condition:
+            display.is_displaying_page: page3_2
+          then:
+            - script.execute:
+                id: adjust_drive_end_time
+                hour_delta: !lambda 'return hour_delta;'
+                minute_delta: !lambda 'return minute_delta;'
+      - if:
+          condition:
+            display.is_displaying_page: page4_1
+          then:
+            - script.execute:
+                id: adjust_fairland_start_time
+                hour_delta: !lambda 'return hour_delta;'
+                minute_delta: !lambda 'return minute_delta;'
+      - if:
+          condition:
+            display.is_displaying_page: page4_2
+          then:
+      - script.execute:
+          id: adjust_fairland_end_time
+          hour_delta: !lambda 'return hour_delta;'
+          minute_delta: !lambda 'return minute_delta;'
+
+  #########################################################
+  # Shared dispatch: back button.
+  # Pointer table maps current page -> parent page; flow value >= 0
+  # also resets app_flow, -1 leaves it untouched.
+  #########################################################
+  - id: navigate_back
+    mode: restart
+    then:
+      - lambda: |-
+          auto cur = id(display1).get_active_page();
+          if (cur == nullptr) {
+            ESP_LOGW("navigate_back", "No active page.");
+            return;
+          }
+          struct Nav { display::DisplayPage *from; display::DisplayPage *to; int flow; };
+          static const Nav nav[] = {
+            {page3, page2, -1}, {page4, page2, -1}, {page5, page2, -1},
+            {page6, page2, -1}, {page7, page2, -1}, {page8, page7, -1},
+            {page11, page7, -1}, {page12, page7, -1}, {page13, page7, -1},
+            {page14, page7, -1},
+            {page3_1, page3, -1}, {page3_2, page3, -1}, {page3_3, page3, -1},
+            {page4_1, page4, -1}, {page4_2, page4, -1}, {page4_3, page4, -1},
+            {page4_4, page4, -1},
+            {page5_1_4, page5, -1}, {page5_2, page5, -1}, {page6_2, page6, -1},
+            {page5_1_1, page5, APP_FLOW_HOME},
+            {page5_1_2, page5, APP_FLOW_HOME},
+            {page5_1_3, page5, APP_FLOW_HOME},
+            {page6_1_1, page6, APP_FLOW_CAL_RX},
+            {page6_1_2, page6, APP_FLOW_CAL_RX},
+          };
+          for (const auto &n : nav) {
+            if (cur == n.from) {
+              if (n.flow >= 0)
+                id(app_flow) = n.flow;
+              id(display1).show_page(n.to);
+              return;
+            }
+          }
+          if (cur == page2) {
+            id(app_flow) = APP_FLOW_HOME;
+            id(display1).show_page(page1);
+            return;
+          }
+          ESP_LOGW("navigate_back", "No back mapping for active page.");
+
+  #########################################################
+  # Shared dispatch: calibration okay buttons (advance steps only).
+  # Finish steps (pH step 4, Rx step 6) keep delay+timestamp in the
+  # button automation — mode: restart here would kill the 300s delay.
+  #########################################################
+  - id: calibration_ok
+    mode: restart
+    parameters:
+      step: int   # 1=pH mid, 2=pH low, 3=pH high, 5=Rx 225mV
+    then:
+      - if:
+          condition:
+            lambda: 'return step == 1;'
+          then:
+            - display.page.show: page5_1_2
+            - lambda: id(ezo_ph).set_calibration_point_mid(7.00);
+            - lambda: id(app_flow) = APP_FLOW_CAL_PH;
+      - if:
+          condition:
+            lambda: 'return step == 2;'
+          then:
+            - display.page.show: page5_1_3
+            - lambda: id(ezo_ph).set_calibration_point_low(4.00);
+            - lambda: id(app_flow) = APP_FLOW_CAL_PH;
+      - if:
+          condition:
+            lambda: 'return step == 3;'
+          then:
+            - display.page.show: page5_1_4
+            - lambda: |-
+                id(ezo_ph).set_calibration_point_high(10.00);
+            - lambda: id(app_flow) = APP_FLOW_CAL_PH;
+      - if:
+          condition:
+            lambda: 'return step == 5;'
+          then:
+            - display.page.show: page6_1_2
+            - lambda: |-
+                id(ezo_rx).set_calibration_generic(225);
+            - lambda: id(app_flow) = APP_FLOW_CAL_RX;
+
+  #########################################################
+  # LCD screen, turn off the LCD after 300 seconds of inactivity, but only if no motion is detected
+  #########################################################
+  - id: turn_off_lcd_timer
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return (id(pir_time) >= 300 && id(app_flow) == APP_FLOW_HOME);
+          then:
+            - lambda: |-
+                id(app_flow) = APP_FLOW_OFF;
+            - light.turn_off: lcd_backlight_light
+
+  #########################################################
+  # Drive Schedule
+  #########################################################
+  - id: drive_schedule
+    mode: restart
+    then:
+      - lambda: |-
+          auto time = id(current_time).now();
+
+          if (!time.is_valid()) {
+            ESP_LOGW("drive schedule", "Time is not initialized.");
+            return;
+          }
+
+          // Convert current time to minutes since midnight
+          int now_mins = time.hour * 60 + time.minute;
+
+          // Get template times
+           int start_mins = id(start_time_drive).hour * 60 + id(start_time_drive).minute;
+           int end_mins = id(end_time_drive).hour * 60 + id(end_time_drive).minute;
+           bool in_schedule = in_time_window(now_mins, start_mins, end_mins);
+
+           // ❄️ 1. Enable pump if it's freezing outside
+           if (id(temp_outside).state <= id(freeze_detection_temp)) {
+             if (!id(drive_state).state) {
+               id(drive_state).turn_on();
+             }
+             ESP_LOGI("Pump enabled", "Outside temperature is lower than %.1f°C", id(temp_outside).state);
+             id(dosing_script) = true;
+             return;
+          }
+
+           // 🧪 2. Enable pump if either chemical pump is running
+           else if ((id(chlorineDosingPump).state) || (id(acidDosingPump).state)) {
+             if (!id(drive_state).state) {
+               id(drive_state).turn_on();
+             }
+             ESP_LOGI("Pump enabled", "Chlorine pump state: %d or Acid pump state: %d.",
+                     id(chlorine_pump_state), id(acid_pump_state));
+             id(dosing_script) = false;
+            return;
+          }
+
+           // 🧹 3. Enable pump if app flow state indicates boost (e.g., backwashing)
+           else if (id(app_flow) == APP_FLOW_BOOST) {
+             if (!id(drive_state).state) {
+               id(drive_state).turn_on();
+             }
+             ESP_LOGI("check_pool_parameters", "Drive boost enabled.");
+             id(dosing_script) = false;
+             return;
+          }
+
+           // 🕒 4. Enable pump during scheduled operation hours
+            else if (in_schedule) {
+               id(drive_state).turn_on();
+             ESP_LOGI("Pump enabled", "Time is between %02d:%02d and %02d:%02d",
+                      id(start_time_drive).hour, id(start_time_drive).minute,
+                      id(end_time_drive).hour, id(end_time_drive).minute);
+            id(dosing_script) = true;
+            id(ezo_disabler_rx).turn_on();
+            id(ezo_disabler_ph).turn_on();
+            id(ezo_interval_enabled) = true;
+            return;
+          }
+
+           // 🚫 5. Disable pump outside scheduled hours and if no other conditions met
+           else {
+             if (id(drive_state).state) {
+               id(drive_state).turn_off();
+             }
+             ESP_LOGI("Pump disabled", "Outside schedule: %02d:%02d and %02d:%02d", 
+                        id(end_time_drive).hour, id(end_time_drive).minute, 
+                        id(start_time_drive).hour, id(start_time_drive).minute);
+            id(dosing_script) = false;
+            id(ezo_disabler_rx).turn_off();
+            id(ezo_disabler_ph).turn_off();
+            id(ezo_interval_enabled) = false;
+            return;
+          }
+
+  #########################################################
+  # Fairland Schedule
+  #########################################################
+  - id: fairland_schedule
+    mode: restart
+    then:
+      - lambda: |-
+          auto time = id(current_time).now();
+
+          if (!time.is_valid()) {
+            ESP_LOGW("fairland", "Time is not initialized.");
+            return;
+          }
+          
+          // Convert current time to minutes since midnight
+          int now_mins = time.hour * 60 + time.minute;
+
+          // Get template times
+           int start_mins = id(start_time_fairland).hour * 60 + id(start_time_fairland).minute;
+           int end_mins = id(end_time_fairland).hour * 60 + id(end_time_fairland).minute;
+            bool in_schedule = in_time_window(now_mins, start_mins, end_mins);
+
+            if (in_schedule) {
+             if (!id(fairland_power).state) {
+               id(fairland_power).turn_on();
+             }
+             ESP_LOGI("Fairland enabled", "Time is between %02d:%02d and %02d:%02d",
+                     id(start_time_fairland).hour, id(start_time_fairland).minute,
+                     id(end_time_fairland).hour, id(end_time_fairland).minute);
+           } 
+           else {
+             if (id(fairland_power).state) {
+               id(fairland_power).turn_off();
+             }
+             ESP_LOGI("Fairland disabled", "Outside schedule: %02d:%02d and %02d:%02d",
+                     id(end_time_fairland).hour, id(end_time_fairland).minute,
+                     id(start_time_fairland).hour, id(start_time_fairland).minute);
+          }
+
+  #########################################################
+  # Check Temperature correction
+  #########################################################
+  - id: temperature_correction_ph
+    mode: restart
+    then:
+      - lambda: |-
+          if (isnan(id(temp_from_pool).state)) {
+            ESP_LOGW("temperature_correction", "Pool temperature unavailable.");
+            return;
+          }
+          id(ezo_ph).set_t(id(temp_from_pool).state);
+
+  #########################################################
+  # 🔁 MAIN ENTRY POINT
+  #########################################################
+  - id: check_pool_parameters
+    mode: restart
+    then:
+      - logger.log:
+          format: "▶️ Starting pool parameter check"
+          level: "INFO"
+          tag: "check_pool_parameters"
+      - script.execute: check_dosing_requirements
+
+  #########################################################
+  # 📋 STEP 1: CHECK PRE-DOSING REQUIREMENTS
+  #########################################################
+  - id: check_dosing_requirements
+    mode: restart
+    then:
+      - lambda: |-
+          // Check if required sensors are initialized
+          if (isnan(id(flowmeter_water).state) || isnan(id(flowmeter_heatpump).state) || isnan(id(ezo_ph).state) || isnan(id(ezo_rx).state)) {
+            ESP_LOGI("check_pool_parameters", "❌ No chemical dosing: sensor(s) not initialized.");
+            id(stop_dosing_pumps).execute();
+            id(abort_dosing).execute();
+            return;
+          }
+
+          // Check if there's flow in the system
+          //ESP_LOGI("check_pool_parameters", "Sensor state: %s", id(water_flow_fairland).state ? "ON" : "OFF");
+          //ESP_LOGI("check_pool_parameters", "Sensor state: %s", id(water_flow_fairland_ext).state ? "ON" : "OFF");
+
+
+          bool flow_system = (id(flowmeter_water).state > 0);
+          bool flow_heatpump1 = (id(flowmeter_heatpump).state > 0);
+          bool flow_fairland = id(water_flow_fairland).state;
+          //bool flow_fairland_ext = id(water_flow_fairland_ext).state;
+           if (!flow_heatpump1 && !flow_system && !flow_fairland) {
+             id(pump_runtime) = 0;
+             ESP_LOGI("check_pool_parameters", "❌ No chemical dosing: no flow.");
+             id(stop_dosing_pumps).execute();
+             id(abort_dosing).execute();
+              return;
+          }
+
+          // Update and verify pump runtime
+          id(pump_runtime) += 30;
+          if (id(pump_runtime) < 600) {
+            ESP_LOGI("check_pool_parameters", "⏳ Waiting: pump runtime = %d (min 600)", id(pump_runtime));
+            id(abort_dosing).execute();
+            return;
+          }
+
+          // Check if pH is dangerously high
+           if (id(ezo_ph).state > 8.5) {
+             ESP_LOGI("check_pool_parameters", "❌ pH too high (%.2f) — manual correction needed.", id(ezo_ph).state);
+             id(stop_dosing_pumps).execute();
+             id(abort_dosing).execute();
+              return;
+          }
+
+          // Skip if in calibration mode
+          if (id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX) {
+            ESP_LOGI("check_pool_parameters", "⛔ Skipping: sensor calibration in progress.");
+            id(abort_dosing).execute();
+            return;
+          }
+
+          // Skip if in boost/backwash mode during peak hours
+          if (id(app_flow) == APP_FLOW_BOOST) {
+            ESP_LOGI("check_pool_parameters", "⚡ Skipping: boost mode (likely backwashing/vacuuming).");
+            id(abort_dosing).execute();
+            return;
+          }
+
+          // Skip if a dosing pump is already active
+          if ((id(chlorineDosingPump).state) || (id(acidDosingPump).state)) {
+            ESP_LOGI("check_pool_parameters", "⛔ Dosing pump already active. Skipping.");
+            id(abort_dosing).execute();
+            return;
+          }
+
+          // Ensure enough time has passed since last dose
+          int last_dose = max(id(last_acid_dose), id(last_chlorine_dose));
+          int since_last = id(app_runtime) - last_dose;
+          if (since_last < 60) {
+            ESP_LOGI("check_pool_parameters", "🕒 Too soon since last dose (%d s < 60 s).", since_last);
+             id(abort_dosing).execute();
+              return;
+          }
+
+          // All preconditions met — start dosing decision chain
+          ESP_LOGI("check_pool_parameters", "✅ All preconditions met — starting dosing decision.");
+          id(check_acid_dosing).execute();
+
+  #########################################################
+  # 🧪 STEP 2: ACID DOSING DECISION
+  #########################################################
+  - id: check_acid_dosing
+    mode: restart
+    then:
+      - logger.log:
+          format: "check_acid_dosing executed"      
+          level: "INFO"
+          tag: "check_acid_dosing"
+      - lambda: |-
+          bool should_dose_acid = id(ezo_ph).state > id(ph_expected_value);
+
+          if (id(acid_startup_lockout)) {
+            ESP_LOGI("dosing", "Acid dosing locked after startup.");
+            return;
+          }
+
+          // Skip if pH calibration was recent
+          if (should_dose_acid && id(last_ph_calibration) > 0) {
+            int since_cal = id(app_runtime) - id(last_ph_calibration);
+            if (since_cal < 600) {
+              ESP_LOGI("check_pool_parameters", "🧪 Skip acid dosing: pH calibration too recent (%d seconds).", since_cal);
+              should_dose_acid = false;
+            }
+          }
+
+          // Skip if acid was dosed recently
+          if (should_dose_acid && id(last_acid_dose) > 0) {
+            int since_acid = id(app_runtime) - id(last_acid_dose);
+            if (since_acid < 3600) {
+              ESP_LOGI("check_pool_parameters", "🧪 Skip acid dosing: last acid dose was %d seconds ago.", since_acid);
+              should_dose_acid = false;
+            }
+          }
+
+          // Trigger acid dosing
+          if (should_dose_acid) {
+            ESP_LOGI("check_pool_parameters", "💧 Dosing acid (pH = %.2f)", id(ezo_ph).state);
+            id(acidDosingPump).turn_on();
+            return;
+          }
+      - delay: 10ms
+      - logger.log: 
+          format: "No conditions met — starting check_chlorine_dosing script"
+          level: "INFO"
+          tag: "check_acid_dosing"
+      - script.execute: check_chlorine_dosing
+
+  #########################################################
+  # 🧼 STEP 3: CHLORINE DOSING DECISION
+  #########################################################
+  - id: check_chlorine_dosing
+    mode: restart
+    then:
+      - logger.log:
+          format: "check_chlorine_dosing executed"      
+          level: "INFO"
+          tag: "check_chlorine_dosing"
+      - lambda: |-
+          // check if acid pump is already active
+          if (id(acidDosingPump).state) {
+            ESP_LOGI("check_pool_parameters", "⛔ Dosing acid pump already active. 🧼 Skip dosing chlorine.");
+            return;
+          }
+
+          bool should_dose_chlorine = (id(ezo_ph).state < 7.8 && id(ezo_rx).state <= id(rx_expected_value));
+
+          if (id(chlorine_startup_lockout)) {
+            ESP_LOGI("dosing", "Chlorine dosing locked after startup.");
+            return;
+          }
+
+          // no dosing needed due to correct levels        
+          if (!should_dose_chlorine)  {
+            ESP_LOGI("check_pool_parameters", "No 🌊 chlorine dosing needed, Rx level %.0f is above expected value %d", id(ezo_rx).state, id(rx_expected_value));
+            return;
+          }
+
+          // Skip if Rx calibration was recent
+          if (should_dose_chlorine && id(last_rx_calibration) > 0) {
+            int since_rx_cal = id(app_runtime) - id(last_rx_calibration);
+            if (since_rx_cal < 600) {
+              ESP_LOGI("check_pool_parameters", "🧼 Skip chlorine dosing: recent Rx calibration (%d seconds).", since_rx_cal);
+              should_dose_chlorine = false;
+            }
+          }
+
+          // Skip if chlorine was dosed recently
+          if (should_dose_chlorine && id(last_chlorine_dose) > 0) {
+            int since_chlorine = id(app_runtime) - id(last_chlorine_dose);
+            if (since_chlorine < 1800) {
+              ESP_LOGI("check_pool_parameters", "🧼 Skip chlorine dosing: last chlorine dose was %d seconds ago.", since_chlorine);
+              should_dose_chlorine = false;
+            }
+          }
+
+          // Trigger chlorine dosing
+          if (should_dose_chlorine) {
+            ESP_LOGI("check_pool_parameters", "🌊 Dosing chlorine (Rx = %.0f)", id(ezo_rx).state);
+            id(chlorineDosingPump).turn_on();
+          }
+
+  #########################################################
+   # 🛑 ABORT SCRIPT — WHEN CONDITIONS ARE NOT MET
+   #########################################################
+  - id: stop_dosing_pumps
+    mode: restart
+    then:
+      - switch.turn_off: chlorineDosingPump
+      - switch.turn_off: acidDosingPump
+      - lambda: |-
+          id(chlorine_pump_state) = false;
+          id(acid_pump_state) = false;
+
+  - id: abort_dosing
+    mode: restart
+    then:
+      - logger.log:
+          format: "⚠️ Dosing logic aborted due to current pool conditions"
+          level: "INFO"
+          tag: "abort_dosing"
+
+#--------------------------------------------------------------------------------
+# Display code
+#--------------------------------------------------------------------------------
+font:
+  - file: "gfonts://Roboto"
+    id: mnuFont
+    size: 20
+    glyphs: "<>+-:/&!%°0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz .()"
+  - file: "gfonts://Roboto"
+    id: timeFont
+    size: 10
+    glyphs: "<>+-:/&!°0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz .()"
+  - file: "gfonts://Roboto"
+    id: calFont
+    size: 24
+    glyphs: "0123456789.n/amVpHM°C -:"
+  - file: "gfonts://Roboto"
+    id: txtFont
+    size: 16
+    glyphs: "<>+-:/&!°0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz .()_"
+
+color:
+  - id: my_blue
+    red: 0%
+    green: 0%
+    blue: 100%
+  - id: my_white
+    red: 100%
+    green: 100%
+    blue: 100%
+
+image:
+  - platform: file
+    file: mdi:menu
+    id: menu
+    resize: 70x70
+    type: BINARY
+  - platform: file
+    file: mdi:arrow-left-thin-circle-outline
+    id: back
+    resize: 70x70
+    type: BINARY
+  - platform: file
+    file: mdi:ph
+    id: ph
+    resize: 70x70
+    type: BINARY
+  - platform: file
+    file: mdi:ph
+    id: ph_icon
+    resize: 70x70
+    type: BINARY
+  - platform: file
+    file: mdi:pump
+    id: pump
+    resize: 70x70
+    type: BINARY
+  - platform: file
+    file: mdi:heat-pump-outline
+    id: heat_pump
+    resize: 70x70
+    type: BINARY
+  - platform: file
+    file: mdi:water-plus-outline
+    id: water_plus
+    resize: 70x70
+    type: BINARY
+  - platform: file
+    file: mdi:checkbox-outline
+    id: checkbox
+    resize: 70x70
+    type: BINARY
+  - platform: file
+    file: mdi:arrow-up-bold-box-outline
+    id: arrowup
+    resize: 70x70
+    type: BINARY
+  - platform: file
+    file: mdi:arrow-down-bold-box-outline
+    id: arrowdown
+    resize: 70x70
+    type: BINARY
+  - platform: file
+    file: mdi:cog-outline
+    id: cog
+    resize: 70x70
+    type: BINARY
+  - platform: file
+    file: mdi:snowflake
+    id: snowflake
+    resize: 70x70
+    type: BINARY
+  - platform: file
+    file: mdi:weather-sunny
+    id: season_icon
+    resize: 70x70
+    type: BINARY
+  - platform: file
+    file: mdi:lightbulb-outline
+    id: pool_light_icon
+    resize: 70x70
+    type: BINARY
+  - platform: file
+    file: mdi:roller-shade
+    id: pool_cover_icon
+    resize: 70x70
+    type: BINARY
+  - platform: file
+    file: mdi:speedometer
+    id: boost_icon
+    resize: 100x100
+    type: BINARY
+  - platform: file
+    file: mdi:page-next-outline
+    id: page_next
+    resize: 70x70
+    type: BINARY
+  - platform: file
+    file: mdi:clock-outline
+    id: clock_outline
+    resize: 70x70
+    type: BINARY
+  - platform: file
+    file: mdi:information-outline
+    id: info_icon
+    resize: 70x70
+    type: BINARY
+
+display:
+  #- platform: ili9xxx
+  - platform: mipi_spi
+    model: ili9341
+    id: display1
+    dc_pin: ${dc_pin}
+    reset_pin: ${reset_pin}
+    invert_colors: false
+    update_interval: 1s
+    spi_mode: MODE0
+    pages:
+# Startup splash screen
+      - id: page_startup
+        lambda: |-
+          it.printf(120, 160, id(mnuFont), TextAlign::CENTER, "P.A.U. starting");
+# Show page home screen
+      - id: page1
+        lambda: |-
+          //----------------------------------------
+          // Blank screen if PIR off
+          //----------------------------------------
+          if (id(app_flow) == APP_FLOW_OFF) {
+            return;
+          }
+
+          //----------------------------------------
+          // Print default screen styling
+          //----------------------------------------   
+          setup_page(it);
+          it.image(20, 240, id(menu));
+
+          //----------------------------------------
+          // Homescreen
+          //----------------------------------------
+          if (id(app_flow) == APP_FLOW_HOME) {
+            // First set of sensor readings
+            if (id(homescreen_index) == 0) {
+              print_sensor_row(it, 35, "Water flow", id(flowmeter_water).state, ": %.2f m3/h");
+              print_sensor_row(it, 60, "Fairland flow", id(flowmeter_heatpump).state, ": %.2f m3/h");
+              print_sensor_row(it, 85, "pH level", id(ezo_ph).state, ": %.2f");
+              it.print(6, 110, id(mnuFont), "pH setpoint");
+              it.printf(122, 110, id(mnuFont), ": %.2f", id(ph_expected_value));
+              print_onoff_row(it, 135, "Acid pump", id(acidDosingPump).state);
+              print_sensor_row(it, 160, "Rx level", id(ezo_rx).state, ": %.0f mV");
+              it.print(6, 185, id(mnuFont), "Rx setpoint");
+              it.printf(122, 185, id(mnuFont), ": %d mV", id(rx_expected_value));
+              print_onoff_row(it, 210, "CL pump", id(chlorineDosingPump).state);
+              return;
+            }
+
+            // Second set of sensor readings
+            else if (id(homescreen_index) == 1) {
+              it.print(120, 35, id(mnuFont), TextAlign::TOP_CENTER, "Temperatures");
+              print_sensor_row(it, 60, "Pool in", id(temp_to_pool).state, ": %.2f °C");
+              print_sensor_row(it, 85, "Pool out", id(temp_from_pool).state, ": %.2f °C");
+              print_sensor_row(it, 110, "Fairland", id(temp_from_inverter).state, ": %.2f °C");
+              print_sensor_row(it, 135, "Poolhouse", id(temp_poolhouse).state, ": %.2f °C");
+              print_sensor_row(it, 160, "Outside", id(temp_outside).state, ": %.2f °C");
+              print_sensor_row(it, 185, "Humidity", id(hum_outside).state, ": %.0f %%");
+              return;
+            }
+            
+            // Third set of sensor readings
+            else if (id(homescreen_index) == 2) {
+              it.print(120, 35, id(mnuFont), TextAlign::TOP_CENTER, "Invertek drive");
+              print_onoff_row(it, 60, "State", id(drive_state).state);
+              print_sensor_row(it, 85, "Frequency", id(out_freq).state, ": %.0f Hz");
+              print_sensor_row(it, 110, "Temp", id(drive_temp).state, ": %.0f  °C");
+              print_sensor_row(it, 135, "Power", id(out_curr).state, ": %.0f A");
+              print_sensor_row(it, 160, "Ramp time", id(drive_ramp_set).state, ": %.0f s");
+              print_onoff_row(it, 185, "Tripped", id(drive_tripped).state);
+              return;
+            }
+            
+            // fourth set of sensor readings
+            else if (id(homescreen_index) == 3) {
+             it.print(120, 35, id(mnuFont), TextAlign::TOP_CENTER, "Fairland heatpump");
+             print_onoff_row(it, 60, "State", id(fairland_power_status).state);
+             print_sensor_row(it, 85, "Compressor", id(fairland_compressor_frequency).state, ": %.0f Hz");
+             print_sensor_row(it, 110, "Speed", id(fairland_compressor_speed).state, ": %.0f %%");
+             print_sensor_row(it, 135, "Inlet", id(fairland_water_inlet).state, ": %.0f °C");
+             print_sensor_row(it, 160, "Outlet", id(fairland_water_outlet).state, ": %.0f °C");
+             it.print(6, 185, id(mnuFont), "Mode");
+             if (id(fairland_working_mode).active_index() == 0) {
+               it.printf(122, 185, id(mnuFont), ": Smart");
+             } else if (id(fairland_working_mode).active_index() == 1){
+               it.printf(122, 185, id(mnuFont), ": Silence");
+             } else {
+                it.printf(122, 185, id(mnuFont), ": S Silence");
+             }
+              print_sensor_row(it, 210, "Setpoint", id(heatpump_setpoint).state, ": %.0f °C");
+             }
+            else if (id(homescreen_index) == 4) {
+               it.print(120, 35, id(mnuFont), TextAlign::TOP_CENTER, "Power");
+               print_sensor_row(it, 60, "Fairland", id(fairland_pulse_counter).state, ": %.1f W");
+               print_sensor_row(it, 85, "Flair", id(flair_pulse_counter).state, ": %.1f W");
+               it.print(120, 110, id(mnuFont), TextAlign::TOP_CENTER, "Energy since boot");
+               print_sensor_row(it, 135, "Fairland", id(fairland_pulse_counter_total).state, ": %.3f kWh");
+               print_sensor_row(it, 160, "Flair", id(flair_pulse_counter_total).state, ": %.3f kWh");
+            }
+            return;
+          }
+# Show page main menu
+      - id: page2
+        lambda: |-
+
+          //----------------------------------------
+          // Print default screen styling
+          //----------------------------------------   
+          setup_page(it);
+          //it.image(20, 240, id(menu));
+
+          //----------------------------------------
+          // Menu system
+          //----------------------------------------
+          it.print(120, 35, id(mnuFont), TextAlign::TOP_CENTER, "Main menu");
+          it.image(20, 70, id(pump));
+          it.image(140, 70, id(heat_pump));
+          it.image(20, 150, id(ph_icon));
+          it.image(140, 150, id(water_plus));
+          it.image(20, 240, id(page_next));
+          it.image(140, 240, id(back));
+# Show page Secondary Menu
+      - id: page7
+        lambda: |-
+
+          //----------------------------------------
+          // Print default screen styling
+          //----------------------------------------   
+          setup_page_back(it);
+
+          //----------------------------------------
+          // Secondary menu
+          //----------------------------------------
+          it.print(120, 35, id(mnuFont), TextAlign::TOP_CENTER, "Secondary menu");
+          it.image(20, 70, id(snowflake));
+          it.image(140, 70, id(pool_light_icon));
+          it.image(20, 150, id(season_icon));
+          it.image(140, 150, id(pool_cover_icon));
+          it.image(20, 240, id(info_icon));
+# Show page Invertek Drive settings
+      - id: page3
+        lambda: |-
+
+          //----------------------------------------
+          // Print default screen styling
+          //----------------------------------------   
+          setup_page_back(it);
+                    
+          //----------------------------------------
+          //  menu
+          //----------------------------------------
+          it.print(120, 35, id(mnuFont), TextAlign::TOP_CENTER, "Invertek drive menu");
+          draw_menu_item(it, 60, 70, 120, "Start time");
+          draw_menu_item(it, 60, 130, 120, "End time");
+          draw_menu_item(it, 60, 190, 120, "Frequency");
+
+# Show page Invertek drive Start time
+      - id: page3_1
+        lambda: |-
+
+          //----------------------------------------
+          // Print default screen styling
+          //----------------------------------------   
+          setup_page_back(it);
+
+          //----------------------------------------
+          // Set Invertek drive start time
+          //----------------------------------------
+
+          it.print(120, 35, id(mnuFont), TextAlign::TOP_CENTER, "Start time");
+          it.image(20, 70, id(arrowup));
+          it.image(20, 170, id(arrowdown));
+          it.printf(55, 155, id(calFont), TextAlign::CENTER, "%02d H", id(start_time_drive).hour);
+          it.printf(95, 155, id(calFont), TextAlign::CENTER, ":");
+          it.printf(135, 155, id(calFont), TextAlign::CENTER, "%02d M", id(start_time_drive).minute);
+          it.image(100, 70, id(arrowup));
+          it.image(100, 170, id(arrowdown));
+
+# Show page Invertek drive end time
+      - id: page3_2
+        lambda: |-
+
+          //----------------------------------------
+          // Print default screen styling
+          //----------------------------------------   
+          setup_page_back(it);
+
+          //----------------------------------------
+          // Set Fairland end time 
+          //----------------------------------------
+
+          it.print(120, 35, id(mnuFont), TextAlign::TOP_CENTER, "End time");
+          it.image(20, 70, id(arrowup));
+          it.image(20, 170, id(arrowdown));
+          it.printf(55, 155, id(calFont), TextAlign::CENTER, "%02d H", id(end_time_drive).hour);
+          it.printf(95, 155, id(calFont), TextAlign::CENTER, ":");
+          it.printf(135, 155, id(calFont), TextAlign::CENTER, "%02d M", id(end_time_drive).minute);
+          it.image(100, 70, id(arrowup));
+          it.image(100, 170, id(arrowdown));
+
+# Show page Invertek drive frequency setting
+      - id: page3_3
+        lambda: |-
+
+          //----------------------------------------
+          // Print default screen styling
+          //----------------------------------------   
+          setup_page_back(it);
+
+          //----------------------------------------
+          // Drive frequency setting
+          //----------------------------------------
+          it.print(120, 35, id(mnuFont), TextAlign::TOP_CENTER, "Frequency");
+          if (id(drive_freq_set).active_index() == 0) {
+            it.filled_rectangle(45, 70, 150, 40, id(my_blue));
+            it.print(120, 90, id(mnuFont), id(my_white), TextAlign::CENTER, "Low (25Hz)");
+          } else {
+            draw_menu_item(it, 45, 70, 150, "Low (25Hz)");
+          }
+          if (id(drive_freq_set).active_index() == 1) {
+            it.filled_rectangle(45, 130, 150, 40, id(my_blue));
+            it.print(120, 150, id(mnuFont), id(my_white), TextAlign::CENTER, "Medium (37Hz)");
+          } else {
+            draw_menu_item(it, 45, 130, 150, "Medium (37Hz)");
+          }
+          if (id(drive_freq_set).active_index() == 2) {
+            it.filled_rectangle(45, 190, 150, 40, id(my_blue));
+            it.print(120, 210, id(mnuFont), id(my_white), TextAlign::CENTER, "High (50Hz)");
+          } else {
+            draw_menu_item(it, 45, 190, 150, "High (50Hz)");
+          }
+# Show page Fairland settings
+      - id: page4
+        lambda: |-
+
+          //----------------------------------------
+          // Print default screen styling
+          //----------------------------------------   
+          setup_page_back(it);
+                    
+          //----------------------------------------
+          // Heatpump menu
+          //----------------------------------------
+
+          it.print(120, 35, id(mnuFont), TextAlign::TOP_CENTER, "Fairland menu");
+          draw_menu_item(it, 20, 70, 90, "Start");
+          draw_menu_item(it, 130, 70, 90, "End");
+          draw_menu_item(it, 20, 130, 90, "Setpoint");
+          draw_menu_item(it, 130, 130, 90, "Mode");
+# Show page Fairland mode selection
+      - id: page4_4
+        lambda: |-
+
+          setup_page_back(it);
+          it.print(120, 35, id(mnuFont), TextAlign::TOP_CENTER, "Fairland mode:");
+          if (id(fairland_working_mode).active_index() == 0) {
+            it.filled_rectangle(45, 70, 150, 40, id(my_blue));
+            it.print(120, 90, id(mnuFont), id(my_white), TextAlign::CENTER, "Smart");
+          } else {
+            draw_menu_item(it, 45, 70, 150, "Smart");
+          }
+          if (id(fairland_working_mode).active_index() == 1) {
+            it.filled_rectangle(45, 130, 150, 40, id(my_blue));
+            it.print(120, 150, id(mnuFont), id(my_white), TextAlign::CENTER, "Silence");
+          } else {
+            draw_menu_item(it, 45, 130, 150, "Silence");
+          }
+          if (id(fairland_working_mode).active_index() == 2) {
+            it.filled_rectangle(45, 190, 150, 40, id(my_blue));
+            it.print(120, 210, id(mnuFont), id(my_white), TextAlign::CENTER, "Super Silence");
+          } else {
+            draw_menu_item(it, 45, 190, 150, "Super Silence");
+          }
+# Show page heatpump Start time
+      - id: page4_1
+        lambda: |-
+
+          //----------------------------------------
+          // Print default screen styling
+          //----------------------------------------   
+          setup_page_back(it);
+
+          //----------------------------------------
+          // Set Fairland start 
+          //----------------------------------------
+
+          it.print(120, 35, id(mnuFont), TextAlign::TOP_CENTER, "Start time");
+          it.image(20, 70, id(arrowup));
+          it.image(20, 170, id(arrowdown));
+          it.printf(55, 155, id(calFont), TextAlign::CENTER, "%02d H", id(start_time_fairland).hour);
+          it.printf(95, 155, id(calFont), TextAlign::CENTER, ":");
+          it.printf(135, 155, id(calFont), TextAlign::CENTER, "%02d M", id(start_time_fairland).minute);
+          it.image(100, 70, id(arrowup));
+          it.image(100, 170, id(arrowdown));
+
+# Show page heatpump end time
+      - id: page4_2
+        lambda: |-
+
+          //----------------------------------------
+          // Print default screen styling
+          //----------------------------------------   
+          setup_page_back(it);
+
+          //----------------------------------------
+          // Set Fairland end time 
+          //----------------------------------------
+
+          it.print(120, 35, id(mnuFont), TextAlign::TOP_CENTER, "End time");
+          it.image(20, 70, id(arrowup));
+          it.image(20, 170, id(arrowdown));
+          it.printf(55, 155, id(calFont), TextAlign::CENTER, "%02d H", id(end_time_fairland).hour);
+          it.printf(95, 155, id(calFont), TextAlign::CENTER, ":");
+          it.printf(135, 155, id(calFont), TextAlign::CENTER, "%02d M", id(end_time_fairland).minute);
+          it.image(100, 70, id(arrowup));
+          it.image(100, 170, id(arrowdown));
+# Show page setpoint heatpump
+      - id: page4_3
+        lambda: |-
+
+          //----------------------------------------
+          // Print default screen styling
+          //----------------------------------------   
+          setup_page_back(it);
+
+          //----------------------------------------
+          // Setpoint Heatpump
+          //----------------------------------------
+
+          it.print(120, 35, id(mnuFont), TextAlign::TOP_CENTER, "Setpoint");
+          it.image(20, 70, id(arrowup));
+          it.image(20, 150, id(arrowdown));
+
+          it.printf(140, 132, id(calFont), "%.0f °C", id(heatpump_setpoint).state);
+
+# Show page pH settings
+      - id: page5
+        lambda: |-
+
+          //----------------------------------------
+          // Print default screen styling
+          //----------------------------------------   
+          setup_page_back(it);
+
+          //----------------------------------------
+          // pH menu
+          //----------------------------------------
+
+          it.print(120, 35, id(mnuFont), TextAlign::TOP_CENTER, "pH menu");
+
+          draw_menu_item(it, 60, 70, 120, "Calibration");
+          draw_menu_item(it, 60, 130, 120, "Setpoint");
+
+# Show page pH probe ph 7 solution
+      - id: page5_1_1
+        lambda: |-
+
+          //----------------------------------------
+          // Print default screen styling
+          //----------------------------------------   
+          setup_page_back(it);
+          draw_calibration_page(it, "Insert pH probe into pH 7", id(ezo_ph).state);
+
+# Show page pH probe ph 4 solution
+      - id: page5_1_2
+        lambda: |-
+
+          //----------------------------------------
+          // Print default screen styling
+          //----------------------------------------   
+          setup_page_back(it);
+          draw_calibration_page(it, "Insert pH probe into pH 4", id(ezo_ph).state);
+
+# Show page pH probe ph 10 solution
+      - id: page5_1_3
+        lambda: |-
+
+          //----------------------------------------
+          // Print default screen styling
+          //----------------------------------------   
+          setup_page_back(it);
+          draw_calibration_page(it, "Insert pH probe into pH 10", id(ezo_ph).state);
+
+# Show page pH completion pH probe
+      - id: page5_1_4
+        lambda: |-
+
+          //----------------------------------------
+          // Print default screen styling
+          //----------------------------------------   
+          setup_page_back(it);
+          draw_completion_page(it);
+
+# Show page set pH level
+      - id: page5_2
+        lambda: |-
+
+          //----------------------------------------
+          // Print default screen styling
+          //----------------------------------------   
+          setup_page_back(it);
+
+          //----------------------------------------
+          // pH set level
+          //----------------------------------------
+
+          it.print(120, 35, id(mnuFont), TextAlign::TOP_CENTER, "Setpoint");
+          it.image(20, 70, id(arrowup));
+          it.image(20, 150, id(arrowdown));
+          it.printf(140, 132, id(calFont), "%.2f" " pH", id(ph_expected_value));
+# Show page Rx settings
+      - id: page6
+        lambda: |-
+
+          //----------------------------------------
+          // Print default screen styling
+          //----------------------------------------   
+          setup_page_back(it);
+
+          //----------------------------------------
+          // Rx menu
+          //----------------------------------------
+
+          it.print(120, 35, id(mnuFont), TextAlign::TOP_CENTER, "Rx menu");
+
+          draw_menu_item(it, 60, 70, 120, "Calibration");
+          draw_menu_item(it, 60, 130, 120, "Setpoint");
+
+# Show page Rx probe 225mV calibartion
+      - id: page6_1_1
+        lambda: |-
+
+          //----------------------------------------
+          // Print default screen styling
+          //----------------------------------------   
+          setup_page_back(it);
+          draw_calibration_page(it, "Insert Rx probe into 225mV", id(ezo_rx).state);
+
+# Show page completion Rx probe
+      - id: page6_1_2
+        lambda: |-
+
+          //----------------------------------------
+          // Print default screen styling
+          //----------------------------------------   
+          setup_page_back(it);
+          draw_completion_page(it);
+
+# Show page set Rx level 
+      - id: page6_2
+        lambda: |-
+
+          //----------------------------------------
+          // Print default screen styling
+          //----------------------------------------   
+          setup_page_back(it);
+
+          //----------------------------------------
+          // Set Rx level
+          //----------------------------------------
+
+          it.print(120, 35, id(mnuFont), TextAlign::TOP_CENTER, "Setpoint");
+          it.image(20, 70, id(arrowup));
+          it.image(20, 150, id(arrowdown));
+          it.printf(140, 132, id(calFont), "%d mV", id(rx_expected_value));
+
+# Show page set Freeze detection temp
+      - id: page8
+        lambda: |-
+
+          //----------------------------------------
+          // Print default screen styling
+          //----------------------------------------   
+          setup_page_back(it);
+
+          //----------------------------------------
+          // Set freeze detection
+          //----------------------------------------
+
+          it.print(120, 35, id(mnuFont), TextAlign::TOP_CENTER, "Freeze detection");
+          it.image(20, 70, id(arrowup));
+          it.image(20, 150, id(arrowdown));
+          it.printf(140, 132, id(calFont), "%.1f" " °C", id(freeze_detection_temp));
+
+# manual boost 
+      - id: page10
+        lambda: |-
+
+          //----------------------------------------
+          // Print default screen styling
+          //----------------------------------------   
+          setup_page(it);
+          it.image(20, 240, id(menu));
+
+          //----------------------------------------
+          // Boost enabled
+          //----------------------------------------
+          if (id(app_flow) == APP_FLOW_BOOST) {
+            it.print(20, 35, id(mnuFont), "Boost enabled");
+            it.image(70, 90, id(boost_icon));
+          }
+
+# Pool light controls
+      - id: page11
+        lambda: |-
+          setup_page_back(it);
+          it.print(120, 35, id(mnuFont), TextAlign::TOP_CENTER, "Pool lights");
+          if (id(pool_lights).remote_values.is_on()) {
+            it.filled_rectangle(45, 70, 70, 40, id(my_blue));
+            it.print(80, 90, id(mnuFont), id(my_white), TextAlign::CENTER, "ON");
+            draw_menu_item(it, 125, 70, 70, "OFF");
+          } else {
+            draw_menu_item(it, 45, 70, 70, "ON");
+            it.filled_rectangle(125, 70, 70, 40, id(my_blue));
+            it.print(160, 90, id(mnuFont), id(my_white), TextAlign::CENTER, "OFF");
+          }
+          draw_menu_item(it, 45, 130, 150, "Next scene");
+          draw_menu_item(it, 45, 190, 150, "Previous scene");
+
+# Season selector
+      - id: page12
+        lambda: |-
+          setup_page_back(it);
+          it.print(120, 35, id(mnuFont), TextAlign::TOP_CENTER, "Season");
+          if (id(season_selector).current_option() == "Fall") {
+            it.filled_rectangle(20, 70, 90, 40, id(my_blue));
+            it.print(65, 90, id(mnuFont), id(my_white), TextAlign::CENTER, "Fall");
+          } else {
+            draw_menu_item(it, 20, 70, 90, "Fall");
+          }
+          if (id(season_selector).current_option() == "Spring") {
+            it.filled_rectangle(130, 70, 90, 40, id(my_blue));
+            it.print(175, 90, id(mnuFont), id(my_white), TextAlign::CENTER, "Spring");
+          } else {
+            draw_menu_item(it, 130, 70, 90, "Spring");
+          }
+          if (id(season_selector).current_option() == "Summer") {
+            it.filled_rectangle(20, 130, 90, 40, id(my_blue));
+            it.print(65, 150, id(mnuFont), id(my_white), TextAlign::CENTER, "Summer");
+          } else {
+            draw_menu_item(it, 20, 130, 90, "Summer");
+          }
+          if (id(season_selector).current_option() == "Winter") {
+            it.filled_rectangle(130, 130, 90, 40, id(my_blue));
+            it.print(175, 150, id(mnuFont), id(my_white), TextAlign::CENTER, "Winter");
+          } else {
+            draw_menu_item(it, 130, 130, 90, "Winter");
+          }
+# Pool cover
+      - id: page13
+        lambda: |-
+          setup_page_back(it);
+          it.print(120, 35, id(mnuFont), TextAlign::TOP_CENTER, "Pool cover");
+
+      - id: page14
+        lambda: |-
+          setup_page_back(it);
+          it.print(120, 35, id(mnuFont), TextAlign::TOP_CENTER, "Device info");
+          it.printf(10, 75, id(txtFont), "IP: %s", id(device_ip_address).state.c_str());
+          it.printf(10, 125, id(txtFont), "Uptime: %s", id(uptime_text).state.c_str());
+          it.print(10, 165, id(txtFont), "Reset reason:");
+          const std::string reason = id(device_reset_reason).state;
+          size_t split = reason.find_last_of(" _", 19);
+          if (split == std::string::npos || split == 0) split = reason.size() < 20 ? reason.size() : 20;
+          else ++split;
+          it.printf(10, 185, id(txtFont), "%s", reason.substr(0, split).c_str());
+          if (split < reason.size()) it.printf(10, 205, id(txtFont), "%s", reason.substr(split).c_str());
+
+#--------------------------------------------------------------------------------
+# Touchscreen code
+#--------------------------------------------------------------------------------         
+touchscreen:
+  platform: xpt2046
+  id: my_touchscreen
+  display: display1
+  cs_pin: ${cs_pin}
+  # any touch resets the LCD blank timer (pir_time) so the screen
+  # never blanks while the user is interacting
+  on_touch:
+    - lambda: id(pir_time) = 0;
+  calibration:
+    x_min: 260
+    x_max: 3900
+    y_min: 200
+    y_max: 3800

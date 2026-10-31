@@ -3165,6 +3165,20 @@ script:
     mode: restart
     then:
       - lambda: |-
+          // Freeze protection must not depend on clock synchronization.
+             // ❄️ 1. Enable pump if it's freezing outside
+          if (id(temp_outside).state <= id(freeze_detection_temp)) {
+            if (!id(drive_state).state) {
+              id(drive_state).turn_on();
+            }
+            if (!id(ezo_interval_enabled)) {
+              id(ezo_wake).execute();
+            }
+            ESP_LOGI("Pump enabled", "Outside temperature is lower than %.1f°C", id(temp_outside).state);
+            id(dosing_script) = true;
+            return;
+          }
+
           auto time = id(current_time).now();
 
           if (!time.is_valid()) {
@@ -3180,21 +3194,8 @@ script:
             int end_mins = id(end_time_drive).hour * 60 + id(end_time_drive).minute;
             bool in_schedule = in_time_window(now_mins, start_mins, end_mins);
 
-            // ❄️ 1. Enable pump if it's freezing outside
-          if (id(temp_outside).state <= id(freeze_detection_temp)) {
-            if (!id(drive_state).state) {
-              id(drive_state).turn_on();
-            }
-            if (!id(ezo_interval_enabled)) {
-              id(ezo_wake).execute();
-            }
-            ESP_LOGI("Pump enabled", "Outside temperature is lower than %.1f°C", id(temp_outside).state);
-            id(dosing_script) = true;
-            return;
-          }
-
-           // 🧪 2. Enable pump if either chemical pump is running
-          else if ((id(chlorineDosingPump).state) || (id(acidDosingPump).state)) {
+            // 🧪 2. Enable pump if either chemical pump is running
+          if ((id(chlorineDosingPump).state) || (id(acidDosingPump).state)) {
             if (!id(drive_state).state) {
                id(drive_state).turn_on();
             }

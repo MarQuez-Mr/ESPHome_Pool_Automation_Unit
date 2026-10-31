@@ -55,7 +55,7 @@ esphome:
     then:
       - if:
           condition:
-            lambda: 'return id(season_selector).current_option() == "Winter";'
+            lambda: 'return id(season_selector).current_option() == "Winter" || id(season_selector).current_option() == "Fall";'
           then:
             - select.set:
                 id: drive_freq_set
@@ -80,8 +80,9 @@ esphome:
       - display.page.show: page1
           
 esp32:
-  board: esp32-s3-devkitc-1
+  board: esp32-s3-devkitc1-n16r8
   variant: esp32s3
+  flash_size: 16MB
   framework:
     type: esp-idf
     advanced:
@@ -90,6 +91,7 @@ esp32:
 psram:
   mode: octal
   speed: 80MHz
+  enable_ecc: true
 
 # Enable logging
 logger:
@@ -1781,7 +1783,7 @@ binary_sensor:
       then:
         - if:
             condition:
-              lambda: 'return id(season_selector).current_option() != "Winter";'
+              lambda: 'return id(season_selector).current_option() != "Winter" && id(season_selector).current_option() != "Fall";'
             then:
               - select.set:
                   id: drive_freq_set

@@ -284,7 +284,18 @@ globals:
   - id: ezo_interval_enabled
     type: bool
     restore_value: no
-    initial_value: "true"
+    initial_value: "false"
+
+  - id: ezo_sensors_asleep
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  # Keep the legacy GPIO power-disabler path available, but opt-in only.
+  - id: ezo_use_disablers
+    type: bool
+    restore_value: no
+    initial_value: "false"
 
 # Holds which homescreen is active (0..3)
   - id: homescreen_index
@@ -448,7 +459,11 @@ interval:
           then:
             - component.update: ezo_ph
             - delay: 3s
-            - component.update: ezo_rx
+            - if:
+                condition:
+                  lambda: "return id(ezo_interval_enabled);"
+                then:
+                  - component.update: ezo_rx
 
 # Interval for pulse_counters
   - interval: 60s
@@ -2776,6 +2791,47 @@ select:
 #--------------------------------------------------------------------------------
 script:
   #########################################################
+  # EZO scripts
+  #########################################################
+  # A read command wakes an EZO circuit from sleep.
+  - id: ezo_wake
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: "return !id(ezo_interval_enabled);"
+          then:
+            - lambda: |-
+                id(ezo_interval_enabled) = true;
+                id(ezo_sensors_asleep) = false;
+            - component.update: ezo_ph
+            - delay: 3s
+            - if:
+                condition:
+                  lambda: "return id(ezo_interval_enabled);"
+                then:
+                  - component.update: ezo_rx
+
+  # Stop polling, allow any in-flight read to finish, then sleep both circuits.
+  - id: ezo_sleep
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: "return !id(ezo_sensors_asleep);"
+          then:
+            - lambda: id(ezo_interval_enabled) = false;
+            - delay: 3s
+            - if:
+                condition:
+                  lambda: "return !id(ezo_interval_enabled);"
+                then:
+                  - lambda: |-
+                      id(ezo_ph).set_sleep();
+                      id(ezo_rx).set_sleep();
+                      id(ezo_sensors_asleep) = true;
+
+  #########################################################
   # PLP scripts
   #########################################################
   - id: plp_send_on
@@ -3080,66 +3136,87 @@ script:
           int now_mins = time.hour * 60 + time.minute;
 
           // Get template times
-           int start_mins = id(start_time_drive).hour * 60 + id(start_time_drive).minute;
-           int end_mins = id(end_time_drive).hour * 60 + id(end_time_drive).minute;
-           bool in_schedule = in_time_window(now_mins, start_mins, end_mins);
+            int start_mins = id(start_time_drive).hour * 60 + id(start_time_drive).minute;
+            int end_mins = id(end_time_drive).hour * 60 + id(end_time_drive).minute;
+            bool in_schedule = in_time_window(now_mins, start_mins, end_mins);
 
-           // ❄️ 1. Enable pump if it's freezing outside
-           if (id(temp_outside).state <= id(freeze_detection_temp)) {
-             if (!id(drive_state).state) {
-               id(drive_state).turn_on();
-             }
-             ESP_LOGI("Pump enabled", "Outside temperature is lower than %.1f°C", id(temp_outside).state);
-             id(dosing_script) = true;
-             return;
+            // ❄️ 1. Enable pump if it's freezing outside
+          if (id(temp_outside).state <= id(freeze_detection_temp)) {
+            if (!id(drive_state).state) {
+              id(drive_state).turn_on();
+            }
+            if (!id(ezo_interval_enabled)) {
+              id(ezo_wake).execute();
+            }
+            ESP_LOGI("Pump enabled", "Outside temperature is lower than %.1f°C", id(temp_outside).state);
+            id(dosing_script) = true;
+            return;
           }
 
            // 🧪 2. Enable pump if either chemical pump is running
-           else if ((id(chlorineDosingPump).state) || (id(acidDosingPump).state)) {
-             if (!id(drive_state).state) {
+          else if ((id(chlorineDosingPump).state) || (id(acidDosingPump).state)) {
+            if (!id(drive_state).state) {
                id(drive_state).turn_on();
-             }
-             ESP_LOGI("Pump enabled", "Chlorine pump state: %d or Acid pump state: %d.",
-                     id(chlorine_pump_state), id(acid_pump_state));
-             id(dosing_script) = false;
+            }
+            if (!id(ezo_interval_enabled)) {
+              id(ezo_wake).execute();
+            }
+            ESP_LOGI("Pump enabled", "Chlorine pump state: %d or Acid pump state: %d.",
+                    id(chlorine_pump_state), id(acid_pump_state));
+            id(dosing_script) = false;
             return;
           }
 
            // 🧹 3. Enable pump if app flow state indicates boost (e.g., backwashing)
-           else if (id(app_flow) == APP_FLOW_BOOST) {
-             if (!id(drive_state).state) {
-               id(drive_state).turn_on();
-             }
-             ESP_LOGI("check_pool_parameters", "Drive boost enabled.");
-             id(dosing_script) = false;
-             return;
+          else if (id(app_flow) == APP_FLOW_BOOST) {
+            if (!id(drive_state).state) {
+              id(drive_state).turn_on();
+            }
+            if (!id(ezo_interval_enabled)) {
+              id(ezo_wake).execute();
+            }
+            ESP_LOGI("check_pool_parameters", "Drive boost enabled.");
+            id(dosing_script) = false;
+            return;
           }
 
            // 🕒 4. Enable pump during scheduled operation hours
-            else if (in_schedule) {
-               id(drive_state).turn_on();
-             ESP_LOGI("Pump enabled", "Time is between %02d:%02d and %02d:%02d",
-                      id(start_time_drive).hour, id(start_time_drive).minute,
-                      id(end_time_drive).hour, id(end_time_drive).minute);
+          else if (in_schedule) {
+            id(drive_state).turn_on();
+            if (!id(ezo_interval_enabled)) {
+              id(ezo_wake).execute();
+            }
+            ESP_LOGI("Pump enabled", "Time is between %02d:%02d and %02d:%02d",
+                    id(start_time_drive).hour, id(start_time_drive).minute,
+                    id(end_time_drive).hour, id(end_time_drive).minute);
             id(dosing_script) = true;
-            id(ezo_disabler_rx).turn_on();
-            id(ezo_disabler_ph).turn_on();
-            id(ezo_interval_enabled) = true;
+            if (id(ezo_use_disablers)) {
+              id(ezo_disabler_rx).turn_on();
+              id(ezo_disabler_ph).turn_on();
+            }
             return;
           }
 
            // 🚫 5. Disable pump outside scheduled hours and if no other conditions met
-           else {
-             if (id(drive_state).state) {
-               id(drive_state).turn_off();
-             }
-             ESP_LOGI("Pump disabled", "Outside schedule: %02d:%02d and %02d:%02d", 
-                        id(end_time_drive).hour, id(end_time_drive).minute, 
-                        id(start_time_drive).hour, id(start_time_drive).minute);
+          else {
+            if (id(drive_state).state) {
+              id(drive_state).turn_off();
+            }
+            ESP_LOGI("Pump disabled", "Outside schedule: %02d:%02d and %02d:%02d", 
+                      id(end_time_drive).hour, id(end_time_drive).minute, 
+                      id(start_time_drive).hour, id(start_time_drive).minute);
             id(dosing_script) = false;
-            id(ezo_disabler_rx).turn_off();
-            id(ezo_disabler_ph).turn_off();
-            id(ezo_interval_enabled) = false;
+            if (id(ezo_use_disablers)) {
+              id(ezo_disabler_rx).turn_off();
+              id(ezo_disabler_ph).turn_off();
+            }
+            if (id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX) {
+              if (!id(ezo_interval_enabled)) {
+                id(ezo_wake).execute();
+              }
+            } else if (!id(ezo_sensors_asleep)) {
+              id(ezo_sleep).execute();
+            }
             return;
           }
 
@@ -4039,7 +4116,7 @@ display:
           // Boost enabled
           //----------------------------------------
           if (id(app_flow) == APP_FLOW_BOOST) {
-            it.print(20, 35, id(mnuFont), "Boost enabled");
+            it.print(20, 35, id(mnuFont), TextAlign::TOP_CENTER, "Boost enabled");
             it.image(70, 90, id(boost_icon));
           }
 

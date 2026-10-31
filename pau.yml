@@ -3012,10 +3012,10 @@ script:
           condition:
             display.is_displaying_page: page4_2
           then:
-      - script.execute:
-          id: adjust_fairland_end_time
-          hour_delta: !lambda 'return hour_delta;'
-          minute_delta: !lambda 'return minute_delta;'
+            - script.execute:
+                id: adjust_fairland_end_time
+                hour_delta: !lambda 'return hour_delta;'
+                minute_delta: !lambda 'return minute_delta;'
 
   #########################################################
   # Shared dispatch: back button.

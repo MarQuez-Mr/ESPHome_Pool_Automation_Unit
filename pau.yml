@@ -44,6 +44,7 @@ esphome:
     - display_helpers.h
     - plp_helper.h
     - schedule_helper.h
+    - dosing_helpers.h
   name: ${name}
   friendly_name: ${friendly_name}
   comment: ${comment}
@@ -237,6 +238,23 @@ globals:
     type: int
     initial_value: '0'
 
+  # Main circulation flow must be published before chemical dosing is allowed.
+  - id: water_flow_received
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: water_flow_last_update_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  # Cancel queued interlock starts once when entering a blocked safety state.
+  - id: dosing_safety_blocked
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
   - id: last_ph_calibration
     type: int
     initial_value: '0'
@@ -387,6 +405,11 @@ datetime:
 # Interval for scripts, sensors and ph temp correction
 # --------------------------------------------------------------------------------
 interval:
+  # Keep active-dose protection independent of dosing decisions and schedules.
+  - interval: 1s
+    then:
+      - script.execute: check_dosing_safety
+
 # interval 5s for home screen and drive schedule
   - interval: 5s
     startup_delay: 3s
@@ -882,10 +905,15 @@ switch:
       then:
         - if:
             condition:
-              lambda: 'return id(chlorine_startup_lockout);'
+              lambda: |-
+                return id(chlorine_startup_lockout) ||
+                       !dosing_flow_is_safe(id(flowmeter_water).state, id(water_flow_received),
+                                            millis(), id(water_flow_last_update_ms)) ||
+                       id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX ||
+                       id(app_flow) == APP_FLOW_BOOST;
             then:
               - logger.log:
-                  format: "Chlorine dosing locked after startup."
+                  format: "Chlorine dosing blocked: startup lockout, unsafe flow, calibration or boost."
                   level: WARN
                   tag: dosing
               - switch.turn_off: chlorineDosingPump
@@ -912,10 +940,15 @@ switch:
       then:
         - if:
             condition:
-              lambda: 'return id(acid_startup_lockout);'
+              lambda: |-
+                return id(acid_startup_lockout) ||
+                       !dosing_flow_is_safe(id(flowmeter_water).state, id(water_flow_received),
+                                            millis(), id(water_flow_last_update_ms)) ||
+                       id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX ||
+                       id(app_flow) == APP_FLOW_BOOST;
             then:
               - logger.log:
-                  format: "Acid dosing locked after startup."
+                  format: "Acid dosing blocked: startup lockout, unsafe flow, calibration or boost."
                   level: WARN
                   tag: dosing
               - switch.turn_off: acidDosingPump
@@ -1425,6 +1458,11 @@ sensor:
     filters:
     - multiply: 0.005 # 1/12 * 60 / 1000
     - round: 2
+    on_value:
+      then:
+        - lambda: |-
+            id(water_flow_last_update_ms) = millis();
+            id(water_flow_received) = true;
 
 # heatpump flow meter
   - platform: pulse_counter
@@ -3274,6 +3312,37 @@ script:
           }
           id(ezo_ph).set_t(id(temp_from_pool).state);
 
+  # Active-dose safety runs even when automatic dosing decisions are disabled.
+  - id: check_dosing_safety
+    mode: restart
+    then:
+      - lambda: |-
+          const bool flow_safe = dosing_flow_is_safe(
+              id(flowmeter_water).state, id(water_flow_received),
+              millis(), id(water_flow_last_update_ms));
+          if (!flow_safe) {
+            id(pump_runtime) = 0;
+          }
+
+          const bool forbidden_mode = id(app_flow) == APP_FLOW_CAL_PH ||
+                                      id(app_flow) == APP_FLOW_CAL_RX ||
+                                      id(app_flow) == APP_FLOW_BOOST;
+          if (flow_safe && !forbidden_mode) {
+            id(dosing_safety_blocked) = false;
+            return;
+          }
+
+          const bool dosing_active = id(acidDosingPump).state || id(chlorineDosingPump).state;
+          if (dosing_active) {
+            ESP_LOGW("dosing_safety", "Stopping dosing: %s.",
+                     !flow_safe ? "main flow missing, invalid, zero or stale" : "calibration or boost");
+          }
+          if (dosing_active || !id(dosing_safety_blocked)) {
+            // OFF also cancels GPIO interlock timers while both pumps report OFF.
+            id(stop_dosing_pumps).execute();
+          }
+          id(dosing_safety_blocked) = true;
+
   #########################################################
   # 🔁 MAIN ENTRY POINT
   #########################################################
@@ -3294,7 +3363,7 @@ script:
     then:
       - lambda: |-
           // Check if required sensors are initialized
-          if (isnan(id(flowmeter_water).state) || isnan(id(flowmeter_heatpump).state) || isnan(id(ezo_ph).state) || isnan(id(ezo_rx).state)) {
+          if (isnan(id(ezo_ph).state) || isnan(id(ezo_rx).state)) {
             ESP_LOGI("check_pool_parameters", "❌ No chemical dosing: sensor(s) not initialized.");
             id(stop_dosing_pumps).execute();
             id(abort_dosing).execute();
@@ -3306,13 +3375,13 @@ script:
           //ESP_LOGI("check_pool_parameters", "Sensor state: %s", id(water_flow_fairland_ext).state ? "ON" : "OFF");
 
 
-          bool flow_system = (id(flowmeter_water).state > 0);
-          bool flow_heatpump1 = (id(flowmeter_heatpump).state > 0);
-          bool flow_fairland = id(water_flow_fairland).state;
+          const bool flow_system = dosing_flow_is_safe(
+              id(flowmeter_water).state, id(water_flow_received),
+              millis(), id(water_flow_last_update_ms));
           //bool flow_fairland_ext = id(water_flow_fairland_ext).state;
-           if (!flow_heatpump1 && !flow_system && !flow_fairland) {
+           if (!flow_system) {
              id(pump_runtime) = 0;
-             ESP_LOGI("check_pool_parameters", "❌ No chemical dosing: no flow.");
+             ESP_LOGI("check_pool_parameters", "❌ No chemical dosing: main flow missing, invalid, zero or stale.");
              id(stop_dosing_pumps).execute();
              id(abort_dosing).execute();
               return;

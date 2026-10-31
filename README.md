@@ -37,9 +37,10 @@ Keep these files together in the ESPHome configuration directory:
 - display_helpers.h
 - plp_helper.h
 - schedule_helper.h
+- dosing_helpers.h
 - secrets.yaml
 
-pau.yml includes the three helper headers. The PLP scene names and Modbus command mapping are maintained in plp_helper.h; schedule-window logic is in schedule_helper.h; shared display drawing functions are in display_helpers.h.
+pau.yml includes the four helper headers. The PLP scene names and Modbus command mapping are maintained in plp_helper.h; schedule-window logic is in schedule_helper.h; shared display drawing functions are in display_helpers.h; main-flow validation is in dosing_helpers.h.
 
 **Secrets:**
 
@@ -74,6 +75,12 @@ The pool-cover page is a placeholder until pool-cover hardware and controls are 
 **Dosing and calibration:**
 
 The controller checks sensor availability and flow before dosing, enforces pump interlocking and timed run periods, and suspends dosing during calibration and boost operation. These are firmware safeguards—not substitutes for correctly installed, independently verified physical protections.
+
+An independent dosing watchdog runs every second, including when automatic dosing decisions are disabled or clock synchronization is unavailable. `flowmeter_water` must measure circulation through the chemical injection line. A published, finite, positive main-flow reading is required; readings older than 75 seconds are unsafe. Fairland flow cannot substitute for main circulation flow. The watchdog stops both dosing pumps on missing, invalid, zero, or stale main flow, or when calibration or boost starts. Flow failure resets the circulation warmup counter, including while dosing is idle. The watchdog never starts or resumes a dose; later automatic doses must pass the normal pre-dose checks again, including the 600-second circulation wait after a flow failure. Existing dose durations and cooldowns are unchanged.
+
+Flow-meter updates remain every 60 seconds. Pulse counts represent an interval average, so detecting zero flow after circulation stops can take approximately 120 seconds plus watchdog scheduling latency. A failed meter that continues publishing a positive reading cannot be detected by this freshness check. The dosing-switch `on_turn_on` guards are reactive: they cannot prevent a brief GPIO activation before rejecting an unsafe request. Use independently verified physical flow protection; do not rely on this firmware for immediate shutdown.
+
+Entering a blocked safety state also sends OFF to both dosing switches once, even if both already report OFF. This cancels pending GPIO interlock activations so a queued dose cannot start automatically after flow recovery or after leaving calibration/boost. Repeated idle watchdog checks do not repeat these OFF commands.
 
 Calibrate pH and Rx/ORP probes using the appropriate solutions before enabling automatic dosing. Confirm thresholds and timing for your pool, sensors, and chemical pumps. Test outputs safely before connecting chemicals.
 Contributing

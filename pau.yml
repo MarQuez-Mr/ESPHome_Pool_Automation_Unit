@@ -54,17 +54,7 @@ esphome:
   on_boot:
     priority: -100
     then:
-      - if:
-          condition:
-            lambda: 'return id(season_selector).current_option() == "Winter" || id(season_selector).current_option() == "Fall";'
-          then:
-            - select.set:
-                id: drive_freq_set
-                option: "25 Hz"
-          else:
-            - select.set:
-                id: drive_freq_set
-                option: "37 Hz"
+      - script.execute: apply_drive_frequency
       - component.update: drive_on_boot_ramp
       - lambda: |-
           int rx  = 0;
@@ -1874,26 +1864,14 @@ binary_sensor:
     use_interrupt: false
     on_press:
       then:
-        - select.set:
-            id: drive_freq_set
-            option: "50 Hz"
         - lambda: 'id(app_flow) = APP_FLOW_BOOST;'
+        - script.execute: apply_drive_frequency
         - switch.turn_on: btnboostLed
         - display.page.show: page10
     on_release:
       then:
-        - if:
-            condition:
-              lambda: 'return id(season_selector).current_option() != "Winter" && id(season_selector).current_option() != "Fall";'
-            then:
-              - select.set:
-                  id: drive_freq_set
-                  option: "37 Hz"
-            else:
-              - select.set:
-                  id: drive_freq_set
-                  option: "25 Hz"
         - lambda: 'id(app_flow) = APP_FLOW_HOME;'
+        - script.execute: apply_drive_frequency
         - switch.turn_off: btnboostLed
         - display.page.show: page1
         
@@ -2877,11 +2855,27 @@ select:
       - Winter
     initial_option: Summer
     restore_value: true
+    on_value:
+      then:
+        - script.execute: apply_drive_frequency
 
 #--------------------------------------------------------------------------------
 # Scripts
 #--------------------------------------------------------------------------------
 script:
+  # One frequency policy for boot, season selection, and boost transitions.
+  - id: apply_drive_frequency
+    mode: restart
+    then:
+      - lambda: |-
+          const bool boost = id(boost_button).state || id(app_flow) == APP_FLOW_BOOST;
+          const auto season = id(season_selector).current_option();
+          const char *option = boost ? "50 Hz" :
+                               (season == "Winter" || season == "Fall") ? "25 Hz" : "37 Hz";
+          auto call = id(drive_freq_set).make_call();
+          call.set_option(option);
+          call.perform();
+
   #########################################################
   # EZO scripts
   #########################################################

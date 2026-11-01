@@ -68,7 +68,7 @@ Check the configuration before flashing, especially after changing GPIO substitu
 
 The display rotates through status screens showing pool flow and chemistry, temperatures, drive status, Fairland heat-pump status, and energy readings. The menu provides pump, heat-pump, pH, Rx, season, pool-light, pool-cover placeholder, and device-information pages.
 
-The drive frequency selector provides 25, 37, and 50 Hz. The season selector offers Fall, Spring, Summer, and Winter. Current configuration behavior uses 25 Hz for Winter boot/boost return and 37 Hz for other seasons; the Fairland schedule currently runs only in Summer.
+The drive frequency selector provides 25, 37, and 50 Hz. The season selector offers Fall, Spring, Summer, and Winter. A shared frequency policy applies 25 Hz for Winter/Fall and 37 Hz for Spring/Summer at boot, on season changes, and after boost release. Boost takes priority at 50 Hz; season changes during boost keep 50 Hz and apply the latest seasonal speed on release. The Fairland schedule currently runs only in Summer.
 
 The pool-cover page is a placeholder until pool-cover hardware and controls are configured.
 

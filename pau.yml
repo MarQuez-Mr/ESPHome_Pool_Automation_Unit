@@ -319,6 +319,21 @@ globals:
     type: int
     initial_value: '0'
 
+  - id: touch_in_progress
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: wake_touch_pending
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: lcd_return_page
+    type: 'esphome::display::DisplayPage *'
+    restore_value: no
+    initial_value: 'nullptr'
+
   - id: freeze_detection_temp
     type: float
     initial_value: '1'
@@ -491,7 +506,11 @@ interval:
           } else {
             ESP_LOGI("dosing_script", "Dosing script is disabled.");
           }
-          id(pir_time)+= 30;
+          if (id(pir).state || id(touch_in_progress)) {
+            id(pir_time) = 0;
+          } else {
+            id(pir_time) += 30;
+          }
           id(turn_off_lcd_timer).execute();
 
 # interval 60s for Temp sensors
@@ -1933,6 +1952,7 @@ binary_sensor:
     filters:
       - delayed_on: 50ms
     on_press:
+      - lambda: id(pir_time) = 0;
       - if:
           # Only respond to the PIR if the screen is off
           condition:
@@ -1942,7 +1962,12 @@ binary_sensor:
             - lambda: |-
                 id(app_flow) = APP_FLOW_HOME;
                 id(pir_time) = 0;
+                auto *page = id(lcd_return_page);
+                id(display1).show_page(page != nullptr && page != page_sleep ? page : page1);
+                id(lcd_return_page) = nullptr;
             - light.turn_on: lcd_backlight_light
+    on_release:
+      - lambda: id(pir_time) = 0;
 
 # Fairland
   - platform: modbus_controller
@@ -3306,10 +3331,13 @@ script:
       - if:
           condition:
             lambda: |-
-              return (id(pir_time) >= 300 && id(app_flow) == APP_FLOW_HOME && id(calibration_mode) == 0);
+              return (id(pir_time) >= 300 && id(app_flow) == APP_FLOW_HOME && id(calibration_mode) == 0 &&
+                      !id(pir).state && !id(touch_in_progress) && !id(wake_touch_pending));
           then:
             - lambda: |-
+                id(lcd_return_page) = id(display1).get_active_page();
                 id(app_flow) = APP_FLOW_OFF;
+            - display.page.show: page_sleep
             - light.turn_off: lcd_backlight_light
 
   #########################################################
@@ -3939,6 +3967,10 @@ display:
       - id: page_startup
         lambda: |-
           it.printf(120, 160, id(mnuFont), TextAlign::CENTER, "P.A.U. starting");
+      - id: page_sleep
+        lambda: |-
+          // No touch controls use this page; the complete wake gesture is ignored.
+          return;
 # Show page home screen
       - id: page1
         lambda: |-
@@ -4503,7 +4535,30 @@ touchscreen:
   # any touch resets the LCD blank timer (pir_time) so the screen
   # never blanks while the user is interacting
   on_touch:
-    - lambda: id(pir_time) = 0;
+    - lambda: |-
+        id(pir_time) = 0;
+        id(touch_in_progress) = true;
+        if (id(app_flow) == APP_FLOW_OFF) {
+          if (id(display1).get_active_page() != page_sleep) {
+            id(lcd_return_page) = id(display1).get_active_page();
+          }
+          id(wake_touch_pending) = true;
+          id(display1).show_page(page_sleep);
+          id(app_flow) = APP_FLOW_HOME;
+          id(lcd_backlight_light).turn_on().perform();
+        }
+  on_release:
+    - lambda: |-
+        id(pir_time) = 0;
+        id(touch_in_progress) = false;
+        if (id(wake_touch_pending)) {
+          if (id(display1).get_active_page() == page_sleep) {
+            auto *page = id(lcd_return_page);
+            id(display1).show_page(page != nullptr && page != page_sleep ? page : page1);
+          }
+          id(lcd_return_page) = nullptr;
+          id(wake_touch_pending) = false;
+        }
   calibration:
     x_min: 260
     x_max: 3900

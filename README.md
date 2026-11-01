@@ -72,6 +72,8 @@ The drive frequency selector provides 25, 37, and 50 Hz. The season selector off
 
 The pool-cover page is a placeholder until pool-cover hardware and controls are configured.
 
+Motion resets display inactivity even when the screen is already on, and an active PIR signal or held touch prevents blanking. After motion/touch ends, the existing 300-second inactivity timer applies. PIR wakes the display directly to its previous page. The first touch on a sleeping display turns on the backlight but stays on a non-interactive blank page until release, consuming the entire wake gesture; the next gesture can operate controls normally. Wake release does not override a newer page selected by boost or another action.
+
 **Dosing and calibration:**
 
 The controller checks sensor availability and flow before dosing, enforces pump interlocking and timed run periods, and suspends dosing during calibration and boost operation. These are firmware safeguards—not substitutes for correctly installed, independently verified physical protections.

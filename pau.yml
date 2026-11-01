@@ -2107,10 +2107,6 @@ binary_sensor:
     register_type: discrete_input
     address: 4
     id: water_flow_fairland
-    on_state:
-      then:
-        - lambda: |-
-            ESP_LOGD("test", "Sensor state changed: %s", id(water_flow_fairland).state ? "ON" : "OFF");
 
 # Fault / Error
   - platform: modbus_controller
@@ -3875,14 +3871,9 @@ script:
           }
 
           // Check if there's flow in the system
-          //ESP_LOGI("check_pool_parameters", "Sensor state: %s", id(water_flow_fairland).state ? "ON" : "OFF");
-          //ESP_LOGI("check_pool_parameters", "Sensor state: %s", id(water_flow_fairland_ext).state ? "ON" : "OFF");
-
-
           const bool flow_system = dosing_flow_is_safe(
               id(flowmeter_water).state, id(water_flow_received),
               millis(), id(water_flow_last_update_ms));
-          //bool flow_fairland_ext = id(water_flow_fairland_ext).state;
            if (!id(drive_state).state || !flow_system) {
               id(pump_runtime) = 0;
               id(pump_flow_timing) = false;

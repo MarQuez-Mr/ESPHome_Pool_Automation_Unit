@@ -892,15 +892,33 @@ switch:
     internal: true
 
 # Switch to enable chlorine dosing
-  - platform: gpio
-    pin: ${gpioChlorineDosing}
+  - platform: template
     name: "Chlorine Pump"
     id: chlorineDosingPump
     icon: mdi:toggle-switch-off-outline
     restore_mode: ALWAYS_OFF
+    optimistic: false
+    lambda: 'return id(chlorine_dosing_relay).state;'
+    turn_on_action:
+      - script.execute:
+          id: request_dose
+          acid: false
+    turn_off_action:
+      - switch.turn_off: chlorine_dosing_relay
+
+  # Only checked dosing requests may energize this internal GPIO switch.
+  - platform: gpio
+    pin: ${gpioChlorineDosing}
+    name: "Chlorine dosing relay"
+    id: chlorine_dosing_relay
+    internal: true
+    icon: mdi:toggle-switch-off-outline
+    restore_mode: ALWAYS_OFF
     inverted: true
-    interlock: [acidDosingPump]
+    interlock: [acid_dosing_relay]
     interlock_wait_time: 30s
+    on_state:
+      - lambda: 'id(chlorineDosingPump).publish_state(id(chlorine_dosing_relay).state);'
     on_turn_on:
       then:
         - if:
@@ -928,15 +946,33 @@ switch:
                   id(chlorine_pump_state) = false;
 
 # Switch to enable acid dosing
-  - platform: gpio
-    pin: ${gpioAcidDosing}
+  - platform: template
     name: "Acid Pump"
     id: acidDosingPump
     icon: mdi:toggle-switch-off-outline
     restore_mode: ALWAYS_OFF
+    optimistic: false
+    lambda: 'return id(acid_dosing_relay).state;'
+    turn_on_action:
+      - script.execute:
+          id: request_dose
+          acid: true
+    turn_off_action:
+      - switch.turn_off: acid_dosing_relay
+
+  # Only checked dosing requests may energize this internal GPIO switch.
+  - platform: gpio
+    pin: ${gpioAcidDosing}
+    name: "Acid dosing relay"
+    id: acid_dosing_relay
+    internal: true
+    icon: mdi:toggle-switch-off-outline
+    restore_mode: ALWAYS_OFF
     inverted: true
-    interlock: [chlorineDosingPump]
+    interlock: [chlorine_dosing_relay]
     interlock_wait_time: 30s
+    on_state:
+      - lambda: 'id(acidDosingPump).publish_state(id(acid_dosing_relay).state);'
     on_turn_on:
       then:
         - if:
@@ -3324,6 +3360,58 @@ script:
             return;
           }
           id(ezo_ph).set_t(id(temp_from_pool).state);
+
+  # All manual and automatic ON requests pass this gate before touching GPIO.
+  - id: request_dose
+    mode: single
+    parameters:
+      acid: bool
+    then:
+      - lambda: |-
+          const int now = id(app_runtime);
+          const int last_dose = max(id(last_acid_dose), id(last_chlorine_dose));
+          const int last_chemical_dose = acid ? id(last_acid_dose) : id(last_chlorine_dose);
+          const int last_calibration = acid ? id(last_ph_calibration) : id(last_rx_calibration);
+          const int cooldown = acid ? 3600 : 1800;
+          const char *reason = nullptr;
+
+          if (!dosing_flow_is_safe(id(flowmeter_water).state, id(water_flow_received),
+                                   millis(), id(water_flow_last_update_ms))) {
+            reason = "main flow missing, invalid, zero or stale";
+          } else if (!std::isfinite(id(ezo_ph).state) || !std::isfinite(id(ezo_rx).state)) {
+            reason = "pH or Rx unavailable, invalid or stale";
+          } else if (id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX ||
+                     id(app_flow) == APP_FLOW_BOOST) {
+            reason = "calibration or boost";
+          } else if (id(pump_runtime) < 600) {
+            reason = "circulation warmup incomplete";
+          } else if (id(ezo_ph).state > 8.5f) {
+            reason = "pH too high; manual correction needed";
+          } else if (id(acid_dosing_relay).state || id(chlorine_dosing_relay).state) {
+            reason = "a dosing pump is already active";
+          } else if (acid ? id(acid_startup_lockout) : id(chlorine_startup_lockout)) {
+            reason = "startup lockout";
+          } else if (now - last_dose < 60) {
+            reason = "too soon since the last dose start";
+          } else if (last_calibration > 0 && now - last_calibration < 600) {
+            reason = "calibration too recent";
+          } else if (last_chemical_dose > 0 && now - last_chemical_dose < cooldown) {
+            reason = "chemical cooldown incomplete";
+          } else if (acid ? id(ezo_ph).state <= id(ph_expected_value) :
+                     (id(ezo_ph).state >= 7.8f || id(ezo_rx).state > id(rx_expected_value))) {
+            reason = "chemistry does not call for this dose";
+          }
+
+          if (reason != nullptr) {
+            ESP_LOGW("dosing_request", "Rejected %s dosing request: %s.", acid ? "acid" : "chlorine", reason);
+            return;
+          }
+
+          if (acid) {
+            id(acid_dosing_relay).turn_on();
+          } else {
+            id(chlorine_dosing_relay).turn_on();
+          }
 
   # Active-dose safety runs even when automatic dosing decisions are disabled.
   - id: check_dosing_safety

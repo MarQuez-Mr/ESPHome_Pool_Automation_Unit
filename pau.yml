@@ -1366,7 +1366,7 @@ sensor:
       # Time raw updates, not the much slower averaged publications.
       - timeout: 75s
       - lambda: |-
-          constexpr size_t window_size = 5;
+          constexpr size_t window_size = 10;
           static float samples[window_size] = {};
           static size_t next_sample = 0;
           static size_t sample_count = 0;

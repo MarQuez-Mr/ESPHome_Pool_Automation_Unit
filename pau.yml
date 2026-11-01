@@ -238,6 +238,17 @@ globals:
     type: int
     initial_value: '0'
 
+  # Track continuous verified circulation independently of dosing decisions.
+  - id: pump_flow_timing
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: pump_flow_started_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
   # Main circulation flow must be published before chemical dosing is allowed.
   - id: water_flow_received
     type: bool
@@ -1030,6 +1041,10 @@ switch:
     register_type: holding
     address: 0
     bitmask: 1
+    on_turn_off:
+      - lambda: |-
+          id(pump_runtime) = 0;
+          id(pump_flow_timing) = false;
     
   - platform: modbus_controller
     modbus_controller_id: drive
@@ -3411,18 +3426,28 @@ script:
     mode: restart
     then:
       - lambda: |-
+          const uint32_t now = millis();
           const bool flow_safe = dosing_flow_is_safe(
               id(flowmeter_water).state, id(water_flow_received),
-              millis(), id(water_flow_last_update_ms));
-          if (!flow_safe) {
+              now, id(water_flow_last_update_ms));
+          const bool drive_on = id(drive_state).state;
+          if (!drive_on || !flow_safe) {
             id(pump_runtime) = 0;
+            id(pump_flow_timing) = false;
+          } else if (!id(pump_flow_timing)) {
+            id(pump_flow_started_ms) = now;
+            id(pump_flow_timing) = true;
+            id(pump_runtime) = 0;
+          } else if (id(pump_runtime) < 600) {
+            const uint32_t elapsed_ms = now - id(pump_flow_started_ms);
+            id(pump_runtime) = std::min(600, static_cast<int>(elapsed_ms / 1000U));
           }
 
           const bool forbidden_mode = id(app_flow) == APP_FLOW_CAL_PH ||
                                       id(app_flow) == APP_FLOW_CAL_RX ||
                                       id(app_flow) == APP_FLOW_BOOST;
           const bool chemistry_safe = std::isfinite(id(ezo_ph).state) && std::isfinite(id(ezo_rx).state);
-          if (flow_safe && chemistry_safe && !forbidden_mode) {
+          if (drive_on && flow_safe && chemistry_safe && !forbidden_mode) {
             id(dosing_safety_blocked) = false;
             return;
           }
@@ -3430,6 +3455,7 @@ script:
           const bool dosing_active = id(acidDosingPump).state || id(chlorineDosingPump).state;
           if (dosing_active) {
             ESP_LOGW("dosing_safety", "Stopping dosing: %s.",
+                     !drive_on ? "circulation drive off" :
                      !flow_safe ? "main flow missing, invalid, zero or stale" :
                      !chemistry_safe ? "pH or Rx unavailable, invalid or stale" : "calibration or boost");
           }
@@ -3475,16 +3501,16 @@ script:
               id(flowmeter_water).state, id(water_flow_received),
               millis(), id(water_flow_last_update_ms));
           //bool flow_fairland_ext = id(water_flow_fairland_ext).state;
-           if (!flow_system) {
-             id(pump_runtime) = 0;
-             ESP_LOGI("check_pool_parameters", "❌ No chemical dosing: main flow missing, invalid, zero or stale.");
+           if (!id(drive_state).state || !flow_system) {
+              id(pump_runtime) = 0;
+              id(pump_flow_timing) = false;
+             ESP_LOGI("check_pool_parameters", "❌ No chemical dosing: drive off or main flow missing, invalid, zero or stale.");
              id(stop_dosing_pumps).execute();
              id(abort_dosing).execute();
               return;
           }
 
           // Update and verify pump runtime
-          id(pump_runtime) += 30;
           if (id(pump_runtime) < 600) {
             ESP_LOGI("check_pool_parameters", "⏳ Waiting: pump runtime = %d (min 600)", id(pump_runtime));
             id(abort_dosing).execute();

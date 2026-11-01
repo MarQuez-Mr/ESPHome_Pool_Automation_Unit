@@ -90,6 +90,8 @@ The exposed "Acid Pump" and "Chlorine Pump" switches are checked request switche
 
 OFF remains unconditional and cancels pending relay activation. Public names and IDs are unchanged, and public states mirror the internal relay states without optimistic ON reporting. Internal relays retain ALWAYS_OFF startup, GPIO interlocking, and the existing 180-second acid / 120-second chlorine time limits.
 
+The circulation warmup uses monotonic elapsed time, updated by the independent one-second watchdog rather than by dosing decisions. It requires the drive state to be ON and main flow to remain valid and fresh. Drive OFF resets warmup immediately; zero, invalid, missing, or stale flow resets it on the next safety check. A restart requires a new 600-second verified interval, and extra dosing requests/checks cannot advance the timer. The counter caps at 600 seconds and handles the millisecond clock rollover. Chemistry availability and calibration/boost do not pause verified circulation timing, but their separate dosing guards still apply. Drive state and interval-averaged flow remain firmware evidence, not an independent physical proof of continuous circulation.
+
 Calibrate pH and Rx/ORP probes using the appropriate solutions before enabling automatic dosing. Confirm thresholds and timing for your pool, sensors, and chemical pumps. Test outputs safely before connecting chemicals.
 Contributing
 

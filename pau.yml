@@ -2011,6 +2011,7 @@ binary_sensor:
             id(apply_drive_frequency).execute();
             id(btnboostLed).turn_on();
             id(display1).show_page(page10);
+            id(wake_display).execute(false);
     on_release:
       then:
         - lambda: |-
@@ -2025,6 +2026,7 @@ binary_sensor:
             id(apply_drive_frequency).execute();
             id(btnboostLed).turn_off();
             id(display1).show_page(page1);
+            id(wake_display).execute(false);
         
 
 # PIR sensor
@@ -2043,15 +2045,9 @@ binary_sensor:
           # Only respond to the PIR if the screen is off
           condition:
             lambda: |-
-              return (id(app_flow) == APP_FLOW_OFF);
+              return !id(lcd_backlight_light).remote_values.is_on();
           then:
-            - lambda: |-
-                id(app_flow) = APP_FLOW_HOME;
-                id(pir_time) = 0;
-                auto *page = id(lcd_return_page);
-                id(display1).show_page(page != nullptr && page != page_sleep ? page : page1);
-                id(lcd_return_page) = nullptr;
-            - light.turn_on: lcd_backlight_light
+            - lambda: id(wake_display).execute(false);
     on_release:
       - lambda: id(pir_time) = 0;
 
@@ -3020,6 +3016,31 @@ select:
 # Scripts
 #--------------------------------------------------------------------------------
 script:
+  # Backlight state owns screen sleep; waking must not clear boost or calibration.
+  - id: wake_display
+    mode: restart
+    parameters:
+      consume_touch: bool
+    then:
+      - lambda: |-
+          id(pir_time) = 0;
+          if (id(lcd_backlight_light).remote_values.is_on()) return;
+          if (id(app_flow) == APP_FLOW_OFF) id(app_flow) = APP_FLOW_HOME;
+          if (consume_touch) {
+            if (id(display1).get_active_page() != page_sleep) {
+              id(lcd_return_page) = const_cast<esphome::display::DisplayPage *>(id(display1).get_active_page());
+            }
+            id(wake_touch_pending) = true;
+            id(display1).show_page(page_sleep);
+          } else {
+            if (id(display1).get_active_page() == page_sleep) {
+              auto *page = id(lcd_return_page);
+              id(display1).show_page(page != nullptr && page != page_sleep ? page : page1);
+            }
+            if (!id(wake_touch_pending)) id(lcd_return_page) = nullptr;
+          }
+          id(lcd_backlight_light).turn_on().perform();
+
   # One frequency policy for boot, season selection, and boost transitions.
   - id: apply_drive_frequency
     mode: restart
@@ -3056,6 +3077,10 @@ script:
             id(btnboostLed).turn_off();
             id(apply_drive_frequency).execute();
           }
+          if (was_boost || id(display1).get_active_page() == page_sleep) {
+            id(display1).show_page(kind == APP_FLOW_CAL_PH ? page5 : page6);
+          }
+          id(wake_display).execute(false);
 
   # Completion and cancellation both require fresh normal chemistry averages.
   - id: end_calibration
@@ -4702,15 +4727,7 @@ touchscreen:
     - lambda: |-
         id(pir_time) = 0;
         id(touch_in_progress) = true;
-        if (id(app_flow) == APP_FLOW_OFF) {
-          if (id(display1).get_active_page() != page_sleep) {
-            id(lcd_return_page) = const_cast<esphome::display::DisplayPage *>(id(display1).get_active_page());
-          }
-          id(wake_touch_pending) = true;
-          id(display1).show_page(page_sleep);
-          id(app_flow) = APP_FLOW_HOME;
-          id(lcd_backlight_light).turn_on().perform();
-        }
+        id(wake_display).execute(true);
   on_release:
     - lambda: |-
         id(pir_time) = 0;

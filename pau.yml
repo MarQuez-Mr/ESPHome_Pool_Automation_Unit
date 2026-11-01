@@ -45,6 +45,7 @@ esphome:
     - plp_helper.h
     - schedule_helper.h
     - dosing_helpers.h
+    - heatpump_helpers.h
   name: ${name}
   friendly_name: ${friendly_name}
   comment: ${comment}
@@ -272,6 +273,17 @@ globals:
     restore_value: no
     initial_value: '0'
 
+  # Heat-pump branch flow must be observed during the current normal circulation run.
+  - id: heatpump_flow_received
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: heatpump_flow_last_update_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
   # Cancel queued interlock starts once when entering a blocked safety state.
   - id: dosing_safety_blocked
     type: bool
@@ -485,6 +497,7 @@ interval:
   - interval: 1s
     then:
       - script.execute: check_dosing_safety
+      - script.execute: check_fairland_flow
 
 # interval 5s for home screen and drive schedule
   - interval: 5s
@@ -1131,6 +1144,8 @@ switch:
           id(chemical_flush_timing) = false;
           id(chemical_flush_keep_drive) = false;
           id(chemical_flush_started_ms) = millis();
+          id(heatpump_flow_received) = false;
+          id(check_fairland_flow).execute();
     
   - platform: modbus_controller
     modbus_controller_id: drive
@@ -1167,13 +1182,30 @@ switch:
 
 # Fairland
 #Read coils 0 - Power switch & 1 - Defrost
-  - platform: modbus_controller
-    modbus_controller_id: fairland_controller
+  - platform: template
     name: "Fairland State"
     id: fairland_power
     icon: mdi:toggle-switch-off-outline
+    restore_mode: ALWAYS_OFF
+    optimistic: false
+    lambda: 'return id(fairland_power_control).state;'
+    turn_on_action:
+      - script.execute: request_fairland_power
+    turn_off_action:
+      - switch.turn_off: fairland_power_control
+
+  # Keep the Modbus power coil private so requests cannot bypass the flow gate.
+  - platform: modbus_controller
+    modbus_controller_id: fairland_controller
+    name: "Fairland power control"
+    id: fairland_power_control
+    internal: true
+    restore_mode: ALWAYS_OFF
     register_type: coil
     address: 0
+    on_state:
+      - lambda: |-
+          id(fairland_power).publish_state(id(fairland_power_control).state);
 
   - platform: modbus_controller
     modbus_controller_id: fairland_controller
@@ -1622,6 +1654,14 @@ sensor:
     filters:
     - multiply: 0.005 # 1/12 * 60 / 1000
     - round: 2
+    on_value:
+      then:
+        - lambda: |-
+            id(heatpump_flow_last_update_ms) = millis();
+            const bool boost = id(app_flow) == APP_FLOW_BOOST ||
+                               (id(boost_button).state && !id(boost_press_rejected) && id(calibration_mode) == 0);
+            id(heatpump_flow_received) = id(drive_state).state && !boost;
+            id(check_fairland_flow).execute();
 
 # drive err num
   - platform: modbus_controller
@@ -1967,6 +2007,7 @@ binary_sensor:
             }
             id(boost_press_rejected) = false;
             id(app_flow) = APP_FLOW_BOOST;
+            id(check_fairland_flow).execute();
             id(apply_drive_frequency).execute();
             id(btnboostLed).turn_on();
             id(display1).show_page(page10);
@@ -3512,6 +3553,37 @@ script:
             }
             return;
           }
+
+  # Observe flow independently of heating schedules and wall-clock synchronization.
+  - id: check_fairland_flow
+    mode: restart
+    then:
+      - lambda: |-
+          const bool boost = id(app_flow) == APP_FLOW_BOOST ||
+                             (id(boost_button).state && !id(boost_press_rejected) && id(calibration_mode) == 0);
+          if (!id(drive_state).state || boost) {
+            id(heatpump_flow_received) = false;
+          }
+          const bool confirmed = heatpump_flow_is_confirmed(
+              id(flowmeter_heatpump).state, id(heatpump_flow_received),
+              millis(), id(heatpump_flow_last_update_ms));
+          if (!confirmed && id(fairland_power_control).state) {
+            ESP_LOGW("fairland_flow", "Requesting heat pump OFF: circulation off, boost, or flow missing/invalid/zero/stale.");
+            id(fairland_power_control).turn_off();
+          }
+
+  # Both manual and scheduled ON requests use this gate before writing the coil.
+  - id: request_fairland_power
+    mode: restart
+    then:
+      - lambda: |-
+          id(check_fairland_flow).execute();
+          if (!heatpump_flow_is_confirmed(id(flowmeter_heatpump).state, id(heatpump_flow_received),
+                                          millis(), id(heatpump_flow_last_update_ms))) {
+            ESP_LOGW("fairland_flow", "Heating request rejected: normal circulation and fresh positive heat-pump flow required.");
+            return;
+          }
+          id(fairland_power_control).turn_on();
 
   #########################################################
   # Fairland Schedule

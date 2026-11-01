@@ -38,9 +38,10 @@ Keep these files together in the ESPHome configuration directory:
 - plp_helper.h
 - schedule_helper.h
 - dosing_helpers.h
+- heatpump_helpers.h
 - secrets.yaml
 
-pau.yml includes the four helper headers. The PLP scene names and Modbus command mapping are maintained in plp_helper.h; schedule-window logic is in schedule_helper.h; shared display drawing functions are in display_helpers.h; main-flow validation, cooldown arithmetic, and the post-dose flush duration are in dosing_helpers.h.
+pau.yml includes the five helper headers. The PLP scene names and Modbus command mapping are maintained in plp_helper.h; schedule-window logic is in schedule_helper.h; shared display drawing functions are in display_helpers.h; main-flow validation, cooldown arithmetic, and the post-dose flush duration are in dosing_helpers.h; heat-pump branch-flow validation is in heatpump_helpers.h.
 
 **Secrets:**
 
@@ -71,6 +72,10 @@ The display rotates through status screens showing pool flow and chemistry, temp
 The drive frequency selector provides 25, 37, and 50 Hz. The season selector offers Fall, Spring, Summer, and Winter. A shared frequency policy applies 25 Hz for Winter/Fall and 37 Hz for Spring/Summer at boot, on season changes, and after boost release. Boost takes priority at 50 Hz; season changes during boost keep 50 Hz and apply the latest seasonal speed on release. The Fairland schedule currently runs only in Summer.
 
 The pool-cover page is a placeholder until pool-cover hardware and controls are configured.
+
+The exposed "Fairland State" switch is a checked request switch. Manual and scheduled ON requests require an already-running circulation drive and a finite, positive `flowmeter_heatpump` reading no older than 75 seconds. Heating never starts or extends the circulation drive schedule. A one-second guard requests heat-pump OFF when the drive stops, boost starts, or heat-pump branch flow becomes missing, invalid, zero, or stale. Drive OFF and boost invalidate prior flow evidence; a new publication during normal circulation is required before heating can be enabled again. Flow recovery alone does not turn heating on; a subsequent schedule/manual request is needed. OFF remains unconditional, and the original Summer/schedule behavior is unchanged.
+
+Heat-pump flow-meter polling remains every 60 seconds. These interval-averaged readings cannot provide immediate loss-of-flow detection or prove the heat pump's required minimum operating flow. The unit's built-in flow protection must remain enabled. OFF is a Modbus command request, not a guarantee of delivery or physical shutdown; verify communication failures and hardware interlocks on the installation. Public power state mirrors the Modbus control state, while "Fairland Power Status" remains the separate device feedback entity.
 
 Motion resets display inactivity even when the screen is already on, and an active PIR signal or held touch prevents blanking. After motion/touch ends, the existing 300-second inactivity timer applies. PIR wakes the display directly to its previous page. The first touch on a sleeping display turns on the backlight but stays on a non-interactive blank page until release, consuming the entire wake gesture; the next gesture can operate controls normally. Wake release does not override a newer page selected by boost or another action.
 

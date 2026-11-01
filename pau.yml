@@ -3121,11 +3121,15 @@ script:
             {page5_1_1, page5, APP_FLOW_HOME},
             {page5_1_2, page5, APP_FLOW_HOME},
             {page5_1_3, page5, APP_FLOW_HOME},
-            {page6_1_1, page6, APP_FLOW_CAL_RX},
-            {page6_1_2, page6, APP_FLOW_CAL_RX},
+            {page6_1_1, page6, APP_FLOW_HOME},
+            {page6_1_2, page6, APP_FLOW_HOME},
           };
           for (const auto &n : nav) {
             if (cur == n.from) {
+              if (cur == page6_1_1 || cur == page6_1_2) {
+                // Keep calibration-solution readings from triggering chlorine on exit.
+                id(last_rx_calibration) = id(app_runtime);
+              }
               if (n.flow >= 0)
                 id(app_flow) = n.flow;
               id(display1).show_page(n.to);

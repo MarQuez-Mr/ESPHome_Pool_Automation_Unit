@@ -41,7 +41,7 @@ Keep these files together in the ESPHome configuration directory:
 - heatpump_helpers.h
 - secrets.yaml
 
-pau.yml includes the five helper headers. The PLP scene names and Modbus command mapping are maintained in plp_helper.h; schedule-window logic is in schedule_helper.h; shared display drawing functions are in display_helpers.h; main-flow validation, cooldown arithmetic, and the post-dose flush duration are in dosing_helpers.h; heat-pump branch-flow validation is in heatpump_helpers.h.
+pau.yml includes the five helper headers. The PLP scene names and Modbus command mapping are maintained in plp_helper.h; schedule-window logic is in schedule_helper.h; shared display drawing functions are in display_helpers.h; main-flow/raw-temperature validation, cooldown arithmetic, and the post-dose flush duration are in dosing_helpers.h; heat-pump branch-flow validation is in heatpump_helpers.h.
 
 **Secrets:**
 
@@ -84,6 +84,10 @@ Motion resets display inactivity even when the screen is already on, and an acti
 The controller checks sensor availability and flow before dosing, enforces pump interlocking and timed run periods, and suspends dosing during calibration and boost operation. These are firmware safeguards—not substitutes for correctly installed, independently verified physical protections.
 
 The one-second dosing watchdog also stops either running chemical pump when the published pH exceeds the shared hard limit of 8.5 (`DOSING_MAX_PH` in dosing_helpers.h). The hard cutoff uses the same averaged sensor value as the dosing entry checks; it does not bypass averaging or provide immediate detection of a raw-sample excursion. A value exactly equal to 8.5 does not trigger this hard abort; ordinary start thresholds still apply. Shutdown follows the normal post-dose flushing path, and a later pH recovery does not resume the interrupted dose automatically.
+
+pH temperature compensation uses the latest raw `temp_from_pool` reading, not its retained display average. A reading must be finite, within the existing -25°C to 75°C sensor bounds, and no older than 75 seconds. Raw updates are captured before display filtering, including unchanged values and valid 0°C readings. Missing, invalid, or stale input skips the compensation command, sets the diagnostic "pH Compensation Temperature Fault" entity, and logs one warning per fault period. Monitoring runs every second and on raw updates; valid recovery clears the input fault and logs recovery.
+
+The selected temperature-failure policy is **warn only**: this fault alone does not block new doses or stop active doses. The EZO continues using its previous/default compensation setting; no fixed-temperature fallback command is sent. Existing dosing safety checks still apply. Display averaging and the hourly compensation-command cadence are unchanged. Recovery makes fresh raw data available for the next scheduled compensation update, not an immediate command. The diagnostic confirms input freshness only, not EZO command acknowledgement or pH accuracy while temperature data is unavailable.
 
 An independent dosing watchdog runs every second, including when automatic dosing decisions are disabled or clock synchronization is unavailable. `flowmeter_water` must measure circulation through the chemical injection line. A published, finite, positive main-flow reading is required; readings older than 75 seconds are unsafe. Fairland flow cannot substitute for main circulation flow. The watchdog stops both dosing pumps on missing, invalid, zero, or stale main flow, or when calibration or boost starts. Flow failure resets the circulation warmup counter, including while dosing is idle. The watchdog never starts or resumes a dose; later automatic doses must pass the normal pre-dose checks again, including the 600-second circulation wait after a flow failure. Existing dose durations and cooldowns are unchanged.
 

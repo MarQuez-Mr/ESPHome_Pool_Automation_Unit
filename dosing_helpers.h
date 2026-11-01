@@ -37,3 +37,9 @@ inline bool dosing_flow_is_safe(float flow, bool received, uint32_t now_ms, uint
     return received && std::isfinite(flow) && flow > 0.0f &&
            static_cast<uint32_t>(now_ms - last_update_ms) <= 75000U;
 }
+
+// Raw temperature freshness is independent of the pool-temperature display average.
+inline bool pool_temperature_is_fresh(float temperature, bool received, uint32_t now_ms, uint32_t last_update_ms) {
+    return received && std::isfinite(temperature) && temperature >= -25.0f && temperature <= 75.0f &&
+           static_cast<uint32_t>(now_ms - last_update_ms) <= 75000U;
+}

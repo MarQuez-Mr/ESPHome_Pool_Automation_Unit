@@ -346,6 +346,27 @@ globals:
     type: float
     initial_value: '0'
 
+  # Compensation consumes raw data, not the display's retained moving average.
+  - id: pool_temperature_raw
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+
+  - id: pool_temperature_received
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: pool_temperature_last_update_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: pool_temperature_fault
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
   - id: chlorine_pump_state
     type: bool
     initial_value: 'false'
@@ -498,6 +519,7 @@ interval:
     then:
       - script.execute: check_dosing_safety
       - script.execute: check_fairland_flow
+      - script.execute: check_pool_temperature
 
 # interval 5s for home screen and drive schedule
   - interval: 5s
@@ -1549,6 +1571,13 @@ sensor:
     icon: "mdi:pool-thermometer"
     address: 0x3600000fbe279528
     update_interval: never
+    on_raw_value:
+      then:
+        - lambda: |-
+            id(pool_temperature_raw) = x;
+            id(pool_temperature_received) = true;
+            id(pool_temperature_last_update_ms) = millis();
+            id(check_pool_temperature).execute();
     filters:
       - filter_out: NaN
       - filter_out: 0.0
@@ -1939,6 +1968,14 @@ number:
 # Binary Sensors
 #--------------------------------------------------------------------------------
 binary_sensor:
+  - platform: template
+    name: "pH Compensation Temperature Fault"
+    id: ph_compensation_temperature_fault
+    device_class: problem
+    entity_category: diagnostic
+    lambda: |-
+      return id(pool_temperature_fault);
+
 # Drive status
   - platform: modbus_controller
     modbus_controller_id: drive
@@ -3652,15 +3689,39 @@ script:
   #########################################################
   # Check Temperature correction
   #########################################################
+  # Warn-only policy: temperature faults do not change dosing permissions.
+  - id: check_pool_temperature
+    mode: restart
+    then:
+      - lambda: |-
+          const bool fresh = pool_temperature_is_fresh(
+              id(pool_temperature_raw), id(pool_temperature_received),
+              millis(), id(pool_temperature_last_update_ms));
+          if (!fresh) {
+            // Expired evidence stays invalid until a new raw publication arrives.
+            id(pool_temperature_received) = false;
+            if (!id(pool_temperature_fault)) {
+              ESP_LOGW("temperature_correction", "Pool temperature missing, invalid or stale; "
+                       "compensation updates are skipped. Dosing continues with the previous/default EZO setting.");
+            }
+            id(pool_temperature_fault) = true;
+          } else {
+            if (id(pool_temperature_fault)) {
+              ESP_LOGI("temperature_correction", "Fresh pool temperature recovered; available for the next compensation update.");
+            }
+            id(pool_temperature_fault) = false;
+          }
+
   - id: temperature_correction_ph
     mode: restart
     then:
       - lambda: |-
-          if (isnan(id(temp_from_pool).state)) {
-            ESP_LOGW("temperature_correction", "Pool temperature unavailable.");
+          id(check_pool_temperature).execute();
+          if (!pool_temperature_is_fresh(id(pool_temperature_raw), id(pool_temperature_received),
+                                         millis(), id(pool_temperature_last_update_ms))) {
             return;
           }
-          id(ezo_ph).set_t(id(temp_from_pool).state);
+          id(ezo_ph).set_t(id(pool_temperature_raw));
 
   # All manual and automatic ON requests pass this gate before touching GPIO.
   - id: request_dose

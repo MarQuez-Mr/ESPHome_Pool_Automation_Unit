@@ -305,6 +305,17 @@ globals:
     type: float
     initial_value: '1'
 
+  # Keep the last valid frost decision during an outside-sensor fault.
+  - id: freeze_required
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: outside_temperature_fault
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
   - id: ezo_interval_enabled
     type: bool
     restore_value: no
@@ -1484,15 +1495,13 @@ sensor:
       icon: mdi:sun-thermometer
       id: "temp_outside"
       filters:
-        - filter_out: NaN
-        - filter_out: 0.0
-        - sliding_window_moving_average:
-            window_size: 10
-            send_every: 10
-        - clamp:
-            min_value: -25
-            max_value: 75
-            ignore_out_of_range: true
+        # Frost decisions need each valid sample, including exactly 0 degrees.
+        - timeout: 75s
+        - lambda: |-
+            if (!std::isfinite(x) || x < -25.0f || x > 75.0f) {
+              return NAN;
+            }
+            return x;
     humidity:
       name: "Outside Humidity"
       id:  "hum_outside"
@@ -1780,13 +1789,18 @@ number:
     optimistic: true
     internal: true
     restore_value: true
+    initial_value: 1.0
     min_value: -5.0
     max_value: 5.0
     step: 1
     mode: 'slider' 
-    set_action: 
+    # Publication also runs during restoration; set_action does not.
+    on_value:
       then:
-        - lambda: id(freeze_detection_temp) = x;
+        - lambda: |-
+            if (std::isfinite(x) && x >= -5.0f && x <= 5.0f) {
+              id(freeze_detection_temp) = x;
+            }
 
 # Fairland
   - platform: modbus_controller
@@ -3220,14 +3234,30 @@ script:
       - lambda: |-
           // Freeze protection must not depend on clock synchronization.
              // ❄️ 1. Enable pump if it's freezing outside
-          if (id(temp_outside).state <= id(freeze_detection_temp)) {
+          const float outside_temp = id(temp_outside).state;
+          if (std::isfinite(outside_temp)) {
+            id(freeze_required) = outside_temp <= id(freeze_detection_temp);
+            if (id(outside_temperature_fault)) {
+              ESP_LOGI("freeze_protection", "Outside temperature readings recovered.");
+            }
+            id(outside_temperature_fault) = false;
+          } else if (!id(outside_temperature_fault)) {
+            ESP_LOGW("freeze_protection", "Outside temperature unavailable; keeping last frost decision (%s). "
+                     "Before the first valid reading, only the normal schedule applies.",
+                     id(freeze_required) ? "ON" : "OFF");
+            id(outside_temperature_fault) = true;
+          }
+
+          if (id(freeze_required)) {
             if (!id(drive_state).state) {
               id(drive_state).turn_on();
             }
             if (!id(ezo_interval_enabled)) {
               id(ezo_wake).execute();
             }
-            ESP_LOGI("Pump enabled", "Outside temperature is lower than %.1f°C", id(temp_outside).state);
+            if (std::isfinite(outside_temp)) {
+              ESP_LOGI("Pump enabled", "Outside temperature is lower than %.1f°C", outside_temp);
+            }
             id(dosing_script) = true;
             return;
           }

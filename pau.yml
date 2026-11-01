@@ -351,6 +351,7 @@ globals:
     initial_value: 'false'
 
   - id: lcd_return_page
+    # show_page needs the original mutable page handle, not the getter's const view.
     type: 'esphome::display::DisplayPage *'
     restore_value: no
     initial_value: 'nullptr'
@@ -3379,7 +3380,7 @@ script:
                       !id(pir).state && !id(touch_in_progress) && !id(wake_touch_pending));
           then:
             - lambda: |-
-                id(lcd_return_page) = id(display1).get_active_page();
+                id(lcd_return_page) = const_cast<esphome::display::DisplayPage *>(id(display1).get_active_page());
                 id(app_flow) = APP_FLOW_OFF;
             - display.page.show: page_sleep
             - light.turn_off: lcd_backlight_light
@@ -4624,7 +4625,7 @@ touchscreen:
         id(touch_in_progress) = true;
         if (id(app_flow) == APP_FLOW_OFF) {
           if (id(display1).get_active_page() != page_sleep) {
-            id(lcd_return_page) = id(display1).get_active_page();
+            id(lcd_return_page) = const_cast<esphome::display::DisplayPage *>(id(display1).get_active_page());
           }
           id(wake_touch_pending) = true;
           id(display1).show_page(page_sleep);

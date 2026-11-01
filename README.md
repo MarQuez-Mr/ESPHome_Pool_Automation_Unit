@@ -45,13 +45,14 @@ pau.yml includes the five helper headers. The PLP scene names and Modbus command
 
 **Secrets:**
 
-Create secrets.yaml in the ESPHome configuration directory. Provide values for every secret referenced by your copy of pau.yml, for example:
-- wifi_ssid: "your-wifi-ssid"
-- wifi_password: "your-wifi-password"
-- pool-automation-unit_ap_password: "unique-fallback-password"
-- pool-automation-unit_api_key: "your-unique-api-encryption-key"
+`secrets.yaml` is included with random placeholder credentials for these `pau.yml` references:
+- `wifi_ssid`
+- `wifi_password`
+- `pool-automation-unit_ap_password`
+- `pool-automation-unit_api_key` (32 random bytes, Base64 encoded)
+- `pau_gui_password`
 
-Use unique credentials. Do not commit secrets.yaml or real keys/passwords to GitHub.
+Replace `wifi_ssid` and `wifi_password` with credentials for your network before connecting. Replace other placeholders with installation-specific credentials. Do not commit `secrets.yaml` or real keys/passwords to GitHub.
 
 **Build and install:**
 

@@ -4041,8 +4041,8 @@ script:
           }
 
   #########################################################
-   # 🛑 ABORT SCRIPT — WHEN CONDITIONS ARE NOT MET
-   #########################################################
+  # 🛑 ABORT SCRIPT — WHEN CONDITIONS ARE NOT MET
+  #########################################################
   - id: stop_dosing_pumps
     mode: restart
     then:

@@ -1530,7 +1530,7 @@ sensor:
           if (sample_count < window_size) {
             return NAN;
           }
-          if (values_since_publish < 5) {
+          if (values_since_publish < 10) {
             return {};
           }
 

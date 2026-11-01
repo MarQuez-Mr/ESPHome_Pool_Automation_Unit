@@ -4417,7 +4417,6 @@ display:
           // Print default screen styling
           //----------------------------------------   
           setup_page(it);
-          it.image(20, 240, id(menu));
 
           //----------------------------------------
           // Boost enabled

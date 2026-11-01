@@ -149,6 +149,9 @@ web_server:
   port: ${web_port}
   version: ${web_version}
   ota: false
+  auth:
+    username: pau
+    password: !secret pau_gui_password
 
 debug:
   update_interval: 57s

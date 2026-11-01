@@ -242,7 +242,8 @@ globals:
 
   # Timers for keeping track of last values
   - id: app_runtime
-    type: int
+    # Diagnostic seconds snapshot only; never use this for dosing safety timing.
+    type: uint64_t
     initial_value: '0'
 
   - id: pump_runtime
@@ -277,21 +278,26 @@ globals:
     restore_value: no
     initial_value: 'false'
 
+  # Exact monotonic milliseconds; the sentinel distinguishes "never" from time zero.
   - id: last_ph_calibration
-    type: int
-    initial_value: '0'
+    type: uint64_t
+    restore_value: no
+    initial_value: 'DOSING_NO_TIMESTAMP'
 
   - id: last_rx_calibration
-    type: int
-    initial_value: '0'
+    type: uint64_t
+    restore_value: no
+    initial_value: 'DOSING_NO_TIMESTAMP'
 
   - id: last_acid_dose
-    type: int
-    initial_value: '0'
+    type: uint64_t
+    restore_value: no
+    initial_value: 'DOSING_NO_TIMESTAMP'
 
   - id: last_chlorine_dose
-    type: int
-    initial_value: '0'
+    type: uint64_t
+    restore_value: no
+    initial_value: 'DOSING_NO_TIMESTAMP'
 
   # Re-establish separation after boot without forcing circulation to start.
   - id: chemical_flush_pending
@@ -515,13 +521,7 @@ interval:
     startup_delay: 7s
     then:
       - lambda: |-
-          id(app_runtime)+= 30;
-          if (id(app_runtime) >= 3600) {
-            id(acid_startup_lockout) = false;
-          }
-          if (id(app_runtime) >= 1800) {
-            id(chlorine_startup_lockout) = false;
-          }
+          id(app_runtime) = esphome::millis_64() / 1000ULL;
           if (id(dosing_script)) {
             ESP_LOGI("dosing_script", "Running dosing logic...");
             id(check_pool_parameters).execute();
@@ -1022,7 +1022,7 @@ switch:
               - switch.turn_off: chlorineDosingPump
             else:
               - lambda: |-
-                  id(last_chlorine_dose) = id(app_runtime);
+                  id(last_chlorine_dose) = esphome::millis_64();
                   id(chlorine_pump_state) = true;
               - delay: 120s
               - switch.turn_off: chlorineDosingPump
@@ -1086,7 +1086,7 @@ switch:
               - switch.turn_off: acidDosingPump
             else:
               - lambda: |-
-                  id(last_acid_dose) = id(app_runtime);
+                  id(last_acid_dose) = esphome::millis_64();
                   id(acid_pump_state) = true;
               - delay: 180s
               - switch.turn_off: acidDosingPump
@@ -3027,9 +3027,9 @@ script:
           ++id(calibration_session);
           id(calibration_mode) = 0;
           if (kind == APP_FLOW_CAL_PH) {
-            id(last_ph_calibration) = id(app_runtime);
+            id(last_ph_calibration) = esphome::millis_64();
           } else {
-            id(last_rx_calibration) = id(app_runtime);
+            id(last_rx_calibration) = esphome::millis_64();
           }
           id(ezo_ph).publish_state(NAN);
           id(ezo_rx).publish_state(NAN);
@@ -3572,11 +3572,13 @@ script:
       acid: bool
     then:
       - lambda: |-
-          const int now = id(app_runtime);
-          const int last_dose = max(id(last_acid_dose), id(last_chlorine_dose));
-          const int last_chemical_dose = acid ? id(last_acid_dose) : id(last_chlorine_dose);
-          const int last_calibration = acid ? id(last_ph_calibration) : id(last_rx_calibration);
-          const int cooldown = acid ? 3600 : 1800;
+          const uint64_t now = esphome::millis_64();
+          id(acid_startup_lockout) = now < ACID_STARTUP_LOCKOUT_MS;
+          id(chlorine_startup_lockout) = now < CHLORINE_STARTUP_LOCKOUT_MS;
+          const uint64_t last_dose = dosing_latest_event(id(last_acid_dose), id(last_chlorine_dose));
+          const uint64_t last_chemical_dose = acid ? id(last_acid_dose) : id(last_chlorine_dose);
+          const uint64_t last_calibration = acid ? id(last_ph_calibration) : id(last_rx_calibration);
+          const uint64_t cooldown = acid ? ACID_DOSING_COOLDOWN_MS : CHLORINE_DOSING_COOLDOWN_MS;
           const char *reason = nullptr;
 
           if (!dosing_flow_is_safe(id(flowmeter_water).state, id(water_flow_received),
@@ -3597,11 +3599,11 @@ script:
             reason = "a dosing pump is already active";
           } else if (acid ? id(acid_startup_lockout) : id(chlorine_startup_lockout)) {
             reason = "startup lockout";
-          } else if (now - last_dose < 60) {
+          } else if (!dosing_wait_elapsed(now, last_dose, DOSING_SHARED_GAP_MS)) {
             reason = "too soon since the last dose start";
-          } else if (last_calibration > 0 && now - last_calibration < 600) {
+          } else if (!dosing_wait_elapsed(now, last_calibration, DOSING_CALIBRATION_HOLDOFF_MS)) {
             reason = "calibration too recent";
-          } else if (last_chemical_dose > 0 && now - last_chemical_dose < cooldown) {
+          } else if (!dosing_wait_elapsed(now, last_chemical_dose, cooldown)) {
             reason = "chemical cooldown incomplete";
           } else if (acid ? id(ezo_ph).state <= id(ph_expected_value) :
                      (id(ezo_ph).state >= 7.8f || id(ezo_rx).state > id(rx_expected_value))) {
@@ -3624,7 +3626,11 @@ script:
     mode: restart
     then:
       - lambda: |-
+          const uint64_t uptime_ms = esphome::millis_64();
+          // Flow and circulation timestamps use millis(), not the 64-bit cooldown clock.
           const uint32_t now = millis();
+          id(acid_startup_lockout) = uptime_ms < ACID_STARTUP_LOCKOUT_MS;
+          id(chlorine_startup_lockout) = uptime_ms < CHLORINE_STARTUP_LOCKOUT_MS;
           const bool flow_safe = dosing_flow_is_safe(
               id(flowmeter_water).state, id(water_flow_received),
               now, id(water_flow_last_update_ms));
@@ -3774,9 +3780,10 @@ script:
           }
 
           // Ensure enough time has passed since last dose
-          int last_dose = max(id(last_acid_dose), id(last_chlorine_dose));
-          int since_last = id(app_runtime) - last_dose;
-          if (since_last < 60) {
+          const uint64_t now_ms = esphome::millis_64();
+          const uint64_t last_dose = dosing_latest_event(id(last_acid_dose), id(last_chlorine_dose));
+          if (!dosing_wait_elapsed(now_ms, last_dose, DOSING_SHARED_GAP_MS)) {
+            const int since_last = now_ms >= last_dose ? static_cast<int>((now_ms - last_dose) / 1000ULL) : 0;
             ESP_LOGI("check_pool_parameters", "🕒 Too soon since last dose (%d s < 60 s).", since_last);
              id(abort_dosing).execute();
               return;
@@ -3798,6 +3805,7 @@ script:
           tag: "check_acid_dosing"
       - lambda: |-
           bool should_dose_acid = id(ezo_ph).state > id(ph_expected_value);
+          const uint64_t now_ms = esphome::millis_64();
 
           if (id(acid_startup_lockout)) {
             ESP_LOGI("dosing", "Acid dosing locked after startup.");
@@ -3805,21 +3813,19 @@ script:
           }
 
           // Skip if pH calibration was recent
-          if (should_dose_acid && id(last_ph_calibration) > 0) {
-            int since_cal = id(app_runtime) - id(last_ph_calibration);
-            if (since_cal < 600) {
-              ESP_LOGI("check_pool_parameters", "🧪 Skip acid dosing: pH calibration too recent (%d seconds).", since_cal);
-              should_dose_acid = false;
-            }
+          if (should_dose_acid && !dosing_wait_elapsed(now_ms, id(last_ph_calibration), DOSING_CALIBRATION_HOLDOFF_MS)) {
+            const int since_cal = now_ms >= id(last_ph_calibration) ?
+                static_cast<int>((now_ms - id(last_ph_calibration)) / 1000ULL) : 0;
+            ESP_LOGI("check_pool_parameters", "🧪 Skip acid dosing: pH calibration too recent (%d seconds).", since_cal);
+            should_dose_acid = false;
           }
 
           // Skip if acid was dosed recently
-          if (should_dose_acid && id(last_acid_dose) > 0) {
-            int since_acid = id(app_runtime) - id(last_acid_dose);
-            if (since_acid < 3600) {
-              ESP_LOGI("check_pool_parameters", "🧪 Skip acid dosing: last acid dose was %d seconds ago.", since_acid);
-              should_dose_acid = false;
-            }
+          if (should_dose_acid && !dosing_wait_elapsed(now_ms, id(last_acid_dose), ACID_DOSING_COOLDOWN_MS)) {
+            const int since_acid = now_ms >= id(last_acid_dose) ?
+                static_cast<int>((now_ms - id(last_acid_dose)) / 1000ULL) : 0;
+            ESP_LOGI("check_pool_parameters", "🧪 Skip acid dosing: last acid dose was %d seconds ago.", since_acid);
+            should_dose_acid = false;
           }
 
           // Trigger acid dosing
@@ -3853,6 +3859,7 @@ script:
           }
 
           bool should_dose_chlorine = (id(ezo_ph).state < 7.8 && id(ezo_rx).state <= id(rx_expected_value));
+          const uint64_t now_ms = esphome::millis_64();
 
           if (id(chlorine_startup_lockout)) {
             ESP_LOGI("dosing", "Chlorine dosing locked after startup.");
@@ -3866,21 +3873,19 @@ script:
           }
 
           // Skip if Rx calibration was recent
-          if (should_dose_chlorine && id(last_rx_calibration) > 0) {
-            int since_rx_cal = id(app_runtime) - id(last_rx_calibration);
-            if (since_rx_cal < 600) {
-              ESP_LOGI("check_pool_parameters", "🧼 Skip chlorine dosing: recent Rx calibration (%d seconds).", since_rx_cal);
-              should_dose_chlorine = false;
-            }
+          if (should_dose_chlorine && !dosing_wait_elapsed(now_ms, id(last_rx_calibration), DOSING_CALIBRATION_HOLDOFF_MS)) {
+            const int since_rx_cal = now_ms >= id(last_rx_calibration) ?
+                static_cast<int>((now_ms - id(last_rx_calibration)) / 1000ULL) : 0;
+            ESP_LOGI("check_pool_parameters", "🧼 Skip chlorine dosing: recent Rx calibration (%d seconds).", since_rx_cal);
+            should_dose_chlorine = false;
           }
 
           // Skip if chlorine was dosed recently
-          if (should_dose_chlorine && id(last_chlorine_dose) > 0) {
-            int since_chlorine = id(app_runtime) - id(last_chlorine_dose);
-            if (since_chlorine < 1800) {
-              ESP_LOGI("check_pool_parameters", "🧼 Skip chlorine dosing: last chlorine dose was %d seconds ago.", since_chlorine);
-              should_dose_chlorine = false;
-            }
+          if (should_dose_chlorine && !dosing_wait_elapsed(now_ms, id(last_chlorine_dose), CHLORINE_DOSING_COOLDOWN_MS)) {
+            const int since_chlorine = now_ms >= id(last_chlorine_dose) ?
+                static_cast<int>((now_ms - id(last_chlorine_dose)) / 1000ULL) : 0;
+            ESP_LOGI("check_pool_parameters", "🧼 Skip chlorine dosing: last chlorine dose was %d seconds ago.", since_chlorine);
+            should_dose_chlorine = false;
           }
 
           // Trigger chlorine dosing

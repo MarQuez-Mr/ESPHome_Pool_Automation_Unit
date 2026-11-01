@@ -223,6 +223,23 @@ globals:
     type: int
     initial_value: '1'
 
+  # Calibration ownership is independent of display navigation.
+  - id: calibration_mode
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: calibration_session
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  # A boost press rejected during calibration must be released before retrying.
+  - id: boost_press_rejected
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
   # Timers for keeping track of last values
   - id: app_runtime
     type: int
@@ -441,7 +458,7 @@ interval:
       - if:
           condition:
             lambda: |-
-              return id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX;
+              return id(calibration_mode) != 0 || id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX;
           then:
             - logger.log:
                 format: "Calibration interval enabled"
@@ -944,7 +961,7 @@ switch:
                        !dosing_flow_is_safe(id(flowmeter_water).state, id(water_flow_received),
                                             millis(), id(water_flow_last_update_ms)) ||
                        !std::isfinite(id(ezo_ph).state) || !std::isfinite(id(ezo_rx).state) ||
-                       id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX ||
+                       id(calibration_mode) != 0 || id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX ||
                        id(app_flow) == APP_FLOW_BOOST;
             then:
               - logger.log:
@@ -998,7 +1015,7 @@ switch:
                        !dosing_flow_is_safe(id(flowmeter_water).state, id(water_flow_received),
                                             millis(), id(water_flow_last_update_ms)) ||
                        !std::isfinite(id(ezo_ph).state) || !std::isfinite(id(ezo_rx).state) ||
-                       id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX ||
+                       id(calibration_mode) != 0 || id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX ||
                        id(app_flow) == APP_FLOW_BOOST;
             then:
               - logger.log:
@@ -1114,34 +1131,32 @@ button:
   - platform: template
     name: "Calibration pH 7.00 (step 1)"
     on_press:
-      lambda: !lambda |-
-        id(ezo_ph).set_calibration_point_mid(7.00);
-        id(app_flow) = APP_FLOW_CAL_PH;
+      - lambda: |-
+          id(begin_calibration).execute(APP_FLOW_CAL_PH);
+          id(ezo_ph).set_calibration_point_mid(7.00);
 
   - platform: template
     name: "Calibration pH 4.00 (step 2)"
     on_press:
-      lambda: !lambda |-
-        id(ezo_ph).set_calibration_point_low(4.00);
-        id(app_flow) = APP_FLOW_CAL_PH;
+      - lambda: |-
+          id(begin_calibration).execute(APP_FLOW_CAL_PH);
+          id(ezo_ph).set_calibration_point_low(4.00);
 
   - platform: template
     name: "Calibration pH 10.00 (step 3)"
     on_press:
-      - lambda: !lambda |-
+      - lambda: |-
+          id(begin_calibration).execute(APP_FLOW_CAL_PH);
           id(ezo_ph).set_calibration_point_high(10.00);
-          id(app_flow) = APP_FLOW_CAL_PH;
-      - delay: 300s
-      - lambda: |- 
-          id(last_ph_calibration) = id(app_runtime);
-          id(app_flow) = APP_FLOW_HOME;
+          id(finish_calibration).execute(APP_FLOW_CAL_PH, id(calibration_session));
 
   - platform: template
     name: "Clear pH Calibration"
     on_press:
-      lambda: !lambda |-
-        id(ezo_ph).clear_calibration();
-        id(app_flow) = APP_FLOW_HOME;
+      - lambda: |-
+          id(begin_calibration).execute(APP_FLOW_CAL_PH);
+          id(ezo_ph).clear_calibration();
+          id(end_calibration).execute(APP_FLOW_CAL_PH);
 
   - platform: template
     name: "Get pH Calibration"
@@ -1165,20 +1180,18 @@ button:
   - platform: template
     name: "Calibration Rx 225mV"
     on_press:
-      - lambda: !lambda |-
+      - lambda: |-
+          id(begin_calibration).execute(APP_FLOW_CAL_RX);
           id(ezo_rx).set_calibration_generic(225);
-          id(app_flow) = APP_FLOW_CAL_RX;
-      - delay: 300s
-      - lambda: !lambda |-
-          id(last_rx_calibration) = id(app_runtime);
-          id(app_flow) = APP_FLOW_HOME;
+          id(finish_calibration).execute(APP_FLOW_CAL_RX, id(calibration_session));
 
   - platform: template
     name: "Clear Rx Calibration"
     on_press:
-      lambda: !lambda |-
-        id(ezo_rx).clear_calibration();
-        id(app_flow) = APP_FLOW_HOME;
+      - lambda: |-
+          id(begin_calibration).execute(APP_FLOW_CAL_RX);
+          id(ezo_rx).clear_calibration();
+          id(end_calibration).execute(APP_FLOW_CAL_RX);
 
   - platform: template
     name: "Get Rx Calibration"
@@ -1279,7 +1292,7 @@ sensor:
           static size_t values_since_publish = 0;
           static bool was_calibrating = false;
 
-          const bool calibrating = id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX;
+          const bool calibrating = id(calibration_mode) != 0 || id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX;
 
           if (!std::isfinite(x)) {
             sample_count = 0;
@@ -1360,7 +1373,7 @@ sensor:
           static size_t values_since_publish = 0;
           static bool was_calibrating = false;
 
-          const bool calibrating = id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX;
+          const bool calibrating = id(calibration_mode) != 0 || id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX;
 
           if (!std::isfinite(x) || x > 1000) {
             sample_count = 0;
@@ -1882,16 +1895,31 @@ binary_sensor:
     use_interrupt: false
     on_press:
       then:
-        - lambda: 'id(app_flow) = APP_FLOW_BOOST;'
-        - script.execute: apply_drive_frequency
-        - switch.turn_on: btnboostLed
-        - display.page.show: page10
+        - lambda: |-
+            if (id(calibration_mode) != 0 || id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX) {
+              id(boost_press_rejected) = true;
+              ESP_LOGW("boost", "Boost rejected while calibration is active.");
+              return;
+            }
+            id(boost_press_rejected) = false;
+            id(app_flow) = APP_FLOW_BOOST;
+            id(apply_drive_frequency).execute();
+            id(btnboostLed).turn_on();
+            id(display1).show_page(page10);
     on_release:
       then:
-        - lambda: 'id(app_flow) = APP_FLOW_HOME;'
-        - script.execute: apply_drive_frequency
-        - switch.turn_off: btnboostLed
-        - display.page.show: page1
+        - lambda: |-
+            if (id(boost_press_rejected)) {
+              id(boost_press_rejected) = false;
+              return;
+            }
+            if (id(calibration_mode) != 0 || id(app_flow) != APP_FLOW_BOOST) {
+              return;
+            }
+            id(app_flow) = APP_FLOW_HOME;
+            id(apply_drive_frequency).execute();
+            id(btnboostLed).turn_off();
+            id(display1).show_page(page1);
         
 
 # PIR sensor
@@ -2322,13 +2350,13 @@ binary_sensor:
             display.is_displaying_page: page5
           then:
           - display.page.show: page5_1_1
-          - lambda: id(app_flow) = APP_FLOW_CAL_PH;
+          - lambda: id(begin_calibration).execute(APP_FLOW_CAL_PH);
       - if:
           condition:
             display.is_displaying_page: page6
           then:
           - display.page.show: page6_1_1
-          - lambda: id(app_flow) = APP_FLOW_CAL_RX;
+          - lambda: id(begin_calibration).execute(APP_FLOW_CAL_RX);
 
 # touchscreen set level page
   - platform: touchscreen
@@ -2375,6 +2403,7 @@ binary_sensor:
           }
 
 # touchscreen pH calibration finish button (delay + timestamp stay here, not in restart script)
+  # The finish action now delegates its wait and timestamp to a session-checked timer.
   - platform: touchscreen
     name: pH calibration finish button
     touchscreen_id: my_touchscreen
@@ -2389,11 +2418,10 @@ binary_sensor:
             condition:
               display.is_displaying_page: page5_1_4
             then:
-            - display.page.show: page5
-            - delay: 300s
             - lambda: |-
-                id(last_ph_calibration) = id(app_runtime);
-                id(app_flow) = APP_FLOW_HOME;
+                if (id(calibration_mode) != APP_FLOW_CAL_PH) return;
+                id(display1).show_page(page5);
+                id(finish_calibration).execute(APP_FLOW_CAL_PH, id(calibration_session));
 
 # touchscreen Rx calibration okay button — handled by calibration_ok script
   - platform: touchscreen
@@ -2415,6 +2443,7 @@ binary_sensor:
                   step: 5
 
 # touchscreen Rx calibration finish button (delay + timestamp stay here, not in restart script)
+  # The finish action now delegates its wait and timestamp to a session-checked timer.
   - platform: touchscreen
     name: Rx calibration finish button
     touchscreen_id: my_touchscreen
@@ -2429,11 +2458,10 @@ binary_sensor:
             condition:
               display.is_displaying_page: page6_1_2
             then:
-            - display.page.show: page6
-            - delay: 300s
             - lambda: |-
-                id(last_rx_calibration) = id(app_runtime);
-                id(app_flow) = APP_FLOW_HOME;
+                if (id(calibration_mode) != APP_FLOW_CAL_RX) return;
+                id(display1).show_page(page6);
+                id(finish_calibration).execute(APP_FLOW_CAL_RX, id(calibration_session));
 
  # touchscreen value up button (shared by setpoint pages)
   - platform: touchscreen
@@ -2886,13 +2914,68 @@ script:
     mode: restart
     then:
       - lambda: |-
-          const bool boost = id(boost_button).state || id(app_flow) == APP_FLOW_BOOST;
+          const bool boost_allowed = id(calibration_mode) == 0 && !id(boost_press_rejected) &&
+                                     id(app_flow) != APP_FLOW_CAL_PH && id(app_flow) != APP_FLOW_CAL_RX;
+          const bool boost = boost_allowed && (id(boost_button).state || id(app_flow) == APP_FLOW_BOOST);
           const auto season = id(season_selector).current_option();
           const char *option = boost ? "50 Hz" :
                                (season == "Winter" || season == "Fall") ? "25 Hz" : "37 Hz";
           auto call = id(drive_freq_set).make_call();
           call.set_option(option);
           call.perform();
+
+  # Every new calibration invalidates any older completion timer.
+  - id: begin_calibration
+    mode: restart
+    parameters:
+      kind: int
+    then:
+      - lambda: |-
+          if (kind != APP_FLOW_CAL_PH && kind != APP_FLOW_CAL_RX) return;
+          id(finish_calibration).stop();
+          ++id(calibration_session);
+          id(calibration_mode) = kind;
+          const bool was_boost = id(app_flow) == APP_FLOW_BOOST;
+          id(app_flow) = kind;
+          if (id(boost_button).state) id(boost_press_rejected) = true;
+          id(stop_dosing_pumps).execute();
+          id(ezo_ph).publish_state(NAN);
+          id(ezo_rx).publish_state(NAN);
+          if (was_boost) {
+            id(btnboostLed).turn_off();
+            id(apply_drive_frequency).execute();
+          }
+
+  # Completion and cancellation both require fresh normal chemistry averages.
+  - id: end_calibration
+    mode: restart
+    parameters:
+      kind: int
+    then:
+      - lambda: |-
+          if ((kind != APP_FLOW_CAL_PH && kind != APP_FLOW_CAL_RX) || id(calibration_mode) != kind) return;
+          ++id(calibration_session);
+          id(calibration_mode) = 0;
+          if (kind == APP_FLOW_CAL_PH) {
+            id(last_ph_calibration) = id(app_runtime);
+          } else {
+            id(last_rx_calibration) = id(app_runtime);
+          }
+          id(ezo_ph).publish_state(NAN);
+          id(ezo_rx).publish_state(NAN);
+          if (id(app_flow) == kind) id(app_flow) = APP_FLOW_HOME;
+
+  # Parameters belong to this invocation, so an older callback cannot end a new session.
+  - id: finish_calibration
+    mode: restart
+    parameters:
+      kind: int
+      session: uint32_t
+    then:
+      - delay: 300s
+      - lambda: |-
+          if (session != id(calibration_session) || id(calibration_mode) != kind) return;
+          id(end_calibration).execute(kind);
 
   #########################################################
   # EZO scripts
@@ -3144,7 +3227,7 @@ script:
             {page3_1, page3, -1}, {page3_2, page3, -1}, {page3_3, page3, -1},
             {page4_1, page4, -1}, {page4_2, page4, -1}, {page4_3, page4, -1},
             {page4_4, page4, -1},
-            {page5_1_4, page5, -1}, {page5_2, page5, -1}, {page6_2, page6, -1},
+            {page5_1_4, page5, APP_FLOW_HOME}, {page5_2, page5, -1}, {page6_2, page6, -1},
             {page5_1_1, page5, APP_FLOW_HOME},
             {page5_1_2, page5, APP_FLOW_HOME},
             {page5_1_3, page5, APP_FLOW_HOME},
@@ -3153,9 +3236,11 @@ script:
           };
           for (const auto &n : nav) {
             if (cur == n.from) {
-              if (cur == page6_1_1 || cur == page6_1_2) {
+              if (cur == page5_1_1 || cur == page5_1_2 || cur == page5_1_3 || cur == page5_1_4) {
+                id(end_calibration).execute(APP_FLOW_CAL_PH);
+              } else if (cur == page6_1_1 || cur == page6_1_2) {
                 // Keep calibration-solution readings from triggering chlorine on exit.
-                id(last_rx_calibration) = id(app_runtime);
+                id(end_calibration).execute(APP_FLOW_CAL_RX);
               }
               if (n.flow >= 0)
                 id(app_flow) = n.flow;
@@ -3174,6 +3259,7 @@ script:
   # Shared dispatch: calibration okay buttons (advance steps only).
   # Finish steps (pH step 4, Rx step 6) keep delay+timestamp in the
   # button automation — mode: restart here would kill the 300s delay.
+  # Those finish actions now delegate to the separate, session-checked timer.
   #########################################################
   - id: calibration_ok
     mode: restart
@@ -3184,32 +3270,32 @@ script:
           condition:
             lambda: 'return step == 1;'
           then:
+            - lambda: id(begin_calibration).execute(APP_FLOW_CAL_PH);
             - display.page.show: page5_1_2
             - lambda: id(ezo_ph).set_calibration_point_mid(7.00);
-            - lambda: id(app_flow) = APP_FLOW_CAL_PH;
       - if:
           condition:
             lambda: 'return step == 2;'
           then:
+            - lambda: id(begin_calibration).execute(APP_FLOW_CAL_PH);
             - display.page.show: page5_1_3
             - lambda: id(ezo_ph).set_calibration_point_low(4.00);
-            - lambda: id(app_flow) = APP_FLOW_CAL_PH;
       - if:
           condition:
             lambda: 'return step == 3;'
           then:
+            - lambda: id(begin_calibration).execute(APP_FLOW_CAL_PH);
             - display.page.show: page5_1_4
             - lambda: |-
                 id(ezo_ph).set_calibration_point_high(10.00);
-            - lambda: id(app_flow) = APP_FLOW_CAL_PH;
       - if:
           condition:
             lambda: 'return step == 5;'
           then:
+            - lambda: id(begin_calibration).execute(APP_FLOW_CAL_RX);
             - display.page.show: page6_1_2
             - lambda: |-
                 id(ezo_rx).set_calibration_generic(225);
-            - lambda: id(app_flow) = APP_FLOW_CAL_RX;
 
   #########################################################
   # LCD screen, turn off the LCD after 300 seconds of inactivity, but only if no motion is detected
@@ -3220,7 +3306,7 @@ script:
       - if:
           condition:
             lambda: |-
-              return (id(pir_time) >= 300 && id(app_flow) == APP_FLOW_HOME);
+              return (id(pir_time) >= 300 && id(app_flow) == APP_FLOW_HOME && id(calibration_mode) == 0);
           then:
             - lambda: |-
                 id(app_flow) = APP_FLOW_OFF;
@@ -3335,7 +3421,7 @@ script:
               id(ezo_disabler_rx).turn_off();
               id(ezo_disabler_ph).turn_off();
             }
-            if (id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX) {
+            if (id(calibration_mode) != 0 || id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX) {
               if (!id(ezo_interval_enabled)) {
                 id(ezo_wake).execute();
               }
@@ -3416,7 +3502,7 @@ script:
             reason = "main flow missing, invalid, zero or stale";
           } else if (!std::isfinite(id(ezo_ph).state) || !std::isfinite(id(ezo_rx).state)) {
             reason = "pH or Rx unavailable, invalid or stale";
-          } else if (id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX ||
+          } else if (id(calibration_mode) != 0 || id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX ||
                      id(app_flow) == APP_FLOW_BOOST) {
             reason = "calibration or boost";
           } else if (id(pump_runtime) < 600) {
@@ -3471,7 +3557,7 @@ script:
             id(pump_runtime) = std::min(600, static_cast<int>(elapsed_ms / 1000U));
           }
 
-          const bool forbidden_mode = id(app_flow) == APP_FLOW_CAL_PH ||
+          const bool forbidden_mode = id(calibration_mode) != 0 || id(app_flow) == APP_FLOW_CAL_PH ||
                                       id(app_flow) == APP_FLOW_CAL_RX ||
                                       id(app_flow) == APP_FLOW_BOOST;
           const bool chemistry_safe = std::isfinite(id(ezo_ph).state) && std::isfinite(id(ezo_rx).state);
@@ -3554,7 +3640,7 @@ script:
           }
 
           // Skip if in calibration mode
-          if (id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX) {
+          if (id(calibration_mode) != 0 || id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX) {
             ESP_LOGI("check_pool_parameters", "⛔ Skipping: sensor calibration in progress.");
             id(abort_dosing).execute();
             return;

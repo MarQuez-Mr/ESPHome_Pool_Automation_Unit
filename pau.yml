@@ -152,6 +152,7 @@ web_server:
   auth:
     username: pau
     password: !secret pau_gui_password
+    type: digest
 
 debug:
   update_interval: 57s

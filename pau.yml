@@ -1556,7 +1556,6 @@ sensor:
     filters:
       - filter_out: NaN
       - filter_out: 0.0
-      #- filter_out: 85
       - sliding_window_moving_average:
           window_size: 10
           send_every: 10
@@ -1581,7 +1580,6 @@ sensor:
     filters:
       - filter_out: NaN
       - filter_out: 0.0
-      #- filter_out: 85
       - sliding_window_moving_average:
           window_size: 10
           send_every: 10
@@ -1599,7 +1597,6 @@ sensor:
     filters:
       - filter_out: NaN
       - filter_out: 0.0
-      #- filter_out: 85
       - sliding_window_moving_average:
           window_size: 10
           send_every: 10
@@ -1617,7 +1614,6 @@ sensor:
     filters:
       - filter_out: NaN
       - filter_out: 0.0
-      #- filter_out: 85
       - sliding_window_moving_average:
           window_size: 10
           send_every: 10
@@ -1637,7 +1633,7 @@ sensor:
         # Frost decisions need each valid sample, including exactly 0 degrees.
         - timeout: 75s
         - lambda: |-
-            if (!std::isfinite(x) || x < -25.0f || x > 75.0f) {
+            if (!std::isfinite(x) || x < -40.0f || x > 80.0f) {
               return NAN;
             }
             return x;
@@ -1646,7 +1642,6 @@ sensor:
       id:  "hum_outside"
       filters:
         - filter_out: NaN
-        - filter_out: 0.0
         - sliding_window_moving_average:
             window_size: 10
             send_every: 10

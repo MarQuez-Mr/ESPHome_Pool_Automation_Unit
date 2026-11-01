@@ -293,6 +293,27 @@ globals:
     type: int
     initial_value: '0'
 
+  # Re-establish separation after boot without forcing circulation to start.
+  - id: chemical_flush_pending
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+
+  - id: chemical_flush_keep_drive
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: chemical_flush_timing
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: chemical_flush_started_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
   - id: rx_expected_value  
     type: int
     initial_value: '675'
@@ -971,6 +992,16 @@ switch:
     interlock_wait_time: 30s
     on_state:
       - lambda: 'id(chlorineDosingPump).publish_state(id(chlorine_dosing_relay).state);'
+    on_turn_off:
+      - lambda: |-
+          if (id(chlorine_pump_state)) {
+            id(chemical_flush_pending) = true;
+            id(chemical_flush_keep_drive) = id(drive_state).state && dosing_flow_is_safe(
+                id(flowmeter_water).state, id(water_flow_received), millis(), id(water_flow_last_update_ms));
+            id(chemical_flush_timing) = false;
+            id(chemical_flush_started_ms) = millis();
+          }
+          id(chlorine_pump_state) = false;
     on_turn_on:
       then:
         - if:
@@ -1025,6 +1056,16 @@ switch:
     interlock_wait_time: 30s
     on_state:
       - lambda: 'id(acidDosingPump).publish_state(id(acid_dosing_relay).state);'
+    on_turn_off:
+      - lambda: |-
+          if (id(acid_pump_state)) {
+            id(chemical_flush_pending) = true;
+            id(chemical_flush_keep_drive) = id(drive_state).state && dosing_flow_is_safe(
+                id(flowmeter_water).state, id(water_flow_received), millis(), id(water_flow_last_update_ms));
+            id(chemical_flush_timing) = false;
+            id(chemical_flush_started_ms) = millis();
+          }
+          id(acid_pump_state) = false;
     on_turn_on:
       then:
         - if:
@@ -1086,6 +1127,9 @@ switch:
       - lambda: |-
           id(pump_runtime) = 0;
           id(pump_flow_timing) = false;
+          id(chemical_flush_timing) = false;
+          id(chemical_flush_keep_drive) = false;
+          id(chemical_flush_started_ms) = millis();
     
   - platform: modbus_controller
     modbus_controller_id: drive
@@ -3406,6 +3450,15 @@ script:
             return;
           }
 
+          // Finish flushing before an outside-schedule shutdown; never restart a stopped drive here.
+          else if (id(chemical_flush_pending) && id(chemical_flush_keep_drive) && id(drive_state).state) {
+            if (!id(ezo_interval_enabled)) {
+              id(ezo_wake).execute();
+            }
+            id(dosing_script) = false;
+            return;
+          }
+
            // 🧹 3. Enable pump if app flow state indicates boost (e.g., backwashing)
           else if (id(app_flow) == APP_FLOW_BOOST) {
             if (!id(drive_state).state) {
@@ -3533,6 +3586,8 @@ script:
           } else if (id(calibration_mode) != 0 || id(app_flow) == APP_FLOW_CAL_PH || id(app_flow) == APP_FLOW_CAL_RX ||
                      id(app_flow) == APP_FLOW_BOOST) {
             reason = "calibration or boost";
+          } else if (id(chemical_flush_pending)) {
+            reason = "post-dose circulation flush incomplete";
           } else if (id(pump_runtime) < 600) {
             reason = "circulation warmup incomplete";
           } else if (id(ezo_ph).state > 8.5f) {
@@ -3573,6 +3628,7 @@ script:
               id(flowmeter_water).state, id(water_flow_received),
               now, id(water_flow_last_update_ms));
           const bool drive_on = id(drive_state).state;
+          if (!drive_on || !flow_safe) id(chemical_flush_keep_drive) = false;
           if (!drive_on || !flow_safe) {
             id(pump_runtime) = 0;
             id(pump_flow_timing) = false;
@@ -3585,11 +3641,32 @@ script:
             id(pump_runtime) = std::min(600, static_cast<int>(elapsed_ms / 1000U));
           }
 
+          // Count only normal, reported-safe circulation after both chemical outputs stop.
+          if (id(chemical_flush_pending)) {
+            const bool chemical_active = id(acidDosingPump).state || id(chlorineDosingPump).state;
+            if (!drive_on || !flow_safe || chemical_active || id(app_flow) == APP_FLOW_BOOST) {
+              id(chemical_flush_timing) = false;
+              id(chemical_flush_started_ms) = now;
+            } else if (!id(chemical_flush_timing)) {
+              // Discard the first partial measurement window after a stop or interruption.
+              const uint32_t reading_age = now - id(water_flow_last_update_ms);
+              const uint32_t since_reset = now - id(chemical_flush_started_ms);
+              if (reading_age < since_reset) {
+                id(chemical_flush_started_ms) = id(water_flow_last_update_ms);
+                id(chemical_flush_timing) = true;
+              }
+            } else if (static_cast<uint32_t>(id(water_flow_last_update_ms) - id(chemical_flush_started_ms)) >= CHEMICAL_FLUSH_MS) {
+              id(chemical_flush_pending) = false;
+              id(chemical_flush_keep_drive) = false;
+              id(chemical_flush_timing) = false;
+            }
+          }
+
           const bool forbidden_mode = id(calibration_mode) != 0 || id(app_flow) == APP_FLOW_CAL_PH ||
                                       id(app_flow) == APP_FLOW_CAL_RX ||
                                       id(app_flow) == APP_FLOW_BOOST;
           const bool chemistry_safe = std::isfinite(id(ezo_ph).state) && std::isfinite(id(ezo_rx).state);
-          if (drive_on && flow_safe && chemistry_safe && !forbidden_mode) {
+          if (drive_on && flow_safe && chemistry_safe && !forbidden_mode && !id(chemical_flush_pending)) {
             id(dosing_safety_blocked) = false;
             return;
           }
@@ -3599,7 +3676,8 @@ script:
             ESP_LOGW("dosing_safety", "Stopping dosing: %s.",
                      !drive_on ? "circulation drive off" :
                      !flow_safe ? "main flow missing, invalid, zero or stale" :
-                     !chemistry_safe ? "pH or Rx unavailable, invalid or stale" : "calibration or boost");
+                      !chemistry_safe ? "pH or Rx unavailable, invalid or stale" :
+                      forbidden_mode ? "calibration or boost" : "post-dose circulation flush incomplete");
           }
           if (dosing_active || !id(dosing_safety_blocked)) {
             // OFF also cancels GPIO interlock timers while both pumps report OFF.
@@ -3650,6 +3728,12 @@ script:
              id(stop_dosing_pumps).execute();
              id(abort_dosing).execute();
               return;
+          }
+
+          if (id(chemical_flush_pending)) {
+            ESP_LOGI("check_pool_parameters", "No chemical dosing: post-dose circulation flush incomplete.");
+            id(abort_dosing).execute();
+            return;
           }
 
           // Update and verify pump runtime

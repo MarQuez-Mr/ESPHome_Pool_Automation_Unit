@@ -3665,7 +3665,7 @@ script:
             reason = "post-dose circulation flush incomplete";
           } else if (id(pump_runtime) < 600) {
             reason = "circulation warmup incomplete";
-          } else if (id(ezo_ph).state > 8.5f) {
+          } else if (id(ezo_ph).state > DOSING_MAX_PH) {
             reason = "pH too high; manual correction needed";
           } else if (id(acid_dosing_relay).state || id(chlorine_dosing_relay).state) {
             reason = "a dosing pump is already active";
@@ -3745,7 +3745,8 @@ script:
                                       id(app_flow) == APP_FLOW_CAL_RX ||
                                       id(app_flow) == APP_FLOW_BOOST;
           const bool chemistry_safe = std::isfinite(id(ezo_ph).state) && std::isfinite(id(ezo_rx).state);
-          if (drive_on && flow_safe && chemistry_safe && !forbidden_mode && !id(chemical_flush_pending)) {
+          const bool ph_within_limit = id(ezo_ph).state <= DOSING_MAX_PH;
+          if (drive_on && flow_safe && chemistry_safe && ph_within_limit && !forbidden_mode && !id(chemical_flush_pending)) {
             id(dosing_safety_blocked) = false;
             return;
           }
@@ -3755,8 +3756,9 @@ script:
             ESP_LOGW("dosing_safety", "Stopping dosing: %s.",
                      !drive_on ? "circulation drive off" :
                      !flow_safe ? "main flow missing, invalid, zero or stale" :
-                      !chemistry_safe ? "pH or Rx unavailable, invalid or stale" :
-                      forbidden_mode ? "calibration or boost" : "post-dose circulation flush incomplete");
+                     !chemistry_safe ? "pH or Rx unavailable, invalid or stale" :
+                     !ph_within_limit ? "pH exceeds hard dosing cutoff" :
+                     forbidden_mode ? "calibration or boost" : "post-dose circulation flush incomplete");
           }
           if (dosing_active || !id(dosing_safety_blocked)) {
             // OFF also cancels GPIO interlock timers while both pumps report OFF.
@@ -3823,7 +3825,7 @@ script:
           }
 
           // Check if pH is dangerously high
-           if (id(ezo_ph).state > 8.5) {
+           if (id(ezo_ph).state > DOSING_MAX_PH) {
              ESP_LOGI("check_pool_parameters", "❌ pH too high (%.2f) — manual correction needed.", id(ezo_ph).state);
              id(stop_dosing_pumps).execute();
              id(abort_dosing).execute();

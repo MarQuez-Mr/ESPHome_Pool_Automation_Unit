@@ -7,6 +7,9 @@
 // Installation-selected minimum circulation time after a chemical pump stops.
 inline constexpr uint32_t CHEMICAL_FLUSH_MS = 60U * 1000U;
 
+// Hard upper limit shared by dosing entry checks and the active-dose watchdog.
+inline constexpr float DOSING_MAX_PH = 8.5f;
+
 // Boot-relative millisecond timestamps are never persisted across restarts.
 inline constexpr uint64_t DOSING_NO_TIMESTAMP = UINT64_MAX;
 inline constexpr uint64_t DOSING_SHARED_GAP_MS = 60ULL * 1000ULL;

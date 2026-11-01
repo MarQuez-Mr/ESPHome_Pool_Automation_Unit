@@ -4303,7 +4303,7 @@ display:
           // Boost enabled
           //----------------------------------------
           if (id(app_flow) == APP_FLOW_BOOST) {
-            it.print(20, 35, id(mnuFont), TextAlign::TOP_CENTER, "Boost enabled");
+            it.print(120, 35, id(mnuFont), TextAlign::TOP_CENTER, "Boost enabled");
             it.image(70, 90, id(boost_icon));
           }
 
